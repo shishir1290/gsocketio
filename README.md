@@ -23,53 +23,52 @@ dispatcher is hand-written.
 
 ---
 
-## Installation
+## Part 1 — Use in Any Go Project
 
-```
-go get gsocketio   # (local module — copy the directory into your project)
+### Step 1 — Install the package
+
+Inside any Go project folder:
+
+```bash
+go get github.com/shishir1290/gsocketio@v1.0.0
 ```
 
-Or just drop the folder alongside your `go.mod` and add:
-
-```
-require gsocketio v0.0.0
-replace gsocketio => ./gsocketio
-```
+This updates your `go.mod` and creates `go.sum` automatically.
 
 ---
 
-## Quick Start
+### Step 2 — Minimal server
+
+Create a `main.go` file:
 
 ```go
 package main
 
 import (
     "encoding/json"
-    "fmt"
     "log"
     "net/http"
 
-    "gsocketio"
+    sio "github.com/shishir1290/gsocketio"
 )
 
 func main() {
-    srv := gsocketio.New(nil)
+    srv := sio.New(nil)
 
-    srv.OnConnect("/", func(c gsocketio.Conn) error {
-        fmt.Println("connected:", c.ID())
+    srv.OnConnect("/", func(c sio.Conn) error {
         c.Join("lobby")
-        c.Emit("welcome", "Hello from gsocketio!")
+        c.Emit("welcome", "Hello!")
         return nil
     })
 
-    srv.OnEvent("/", "chat", func(c gsocketio.Conn, args []json.RawMessage) {
+    srv.OnEvent("/", "chat", func(c sio.Conn, args []json.RawMessage) {
         var msg string
         json.Unmarshal(args[0], &msg)
-        srv.ToRoom("/", "lobby", "chat", c, msg)   // broadcast, skip sender
+        srv.ToRoom("/", "lobby", "chat", c, msg)
     })
 
-    srv.OnDisconnect("/", func(c gsocketio.Conn, reason string) {
-        fmt.Println("disconnected:", c.ID(), reason)
+    srv.OnDisconnect("/", func(c sio.Conn, reason string) {
+        log.Println("disconnected:", c.ID())
     })
 
     go srv.Serve()
@@ -80,183 +79,122 @@ func main() {
 
 ---
 
-## API Reference
+### Step 3 — Run
+
+```bash
+go mod tidy
+go run main.go
+```
+
+---
+
+## Part 2 — Full API Reference
 
 ### Creating a server
 
 ```go
-srv := gsocketio.New(nil)   // sensible defaults
+// Default options
+srv := sio.New(nil)
 
-srv := gsocketio.New(&gsocketio.Options{
+// Custom options
+srv := sio.New(&sio.Options{
     PingInterval: 25 * time.Second,
     PingTimeout:  20 * time.Second,
-    MaxPayload:   1_000_000,           // bytes
+    MaxPayload:   1_000_000,
 })
-```
-
-### Mounting on an HTTP mux
-
-```go
-mux := http.NewServeMux()
-mux.Handle("/socket.io/", srv)          // srv implements http.Handler
-http.ListenAndServe(":8080", mux)
-```
-
-### Starting the accept loop
-
-```go
-go srv.Serve()   // non-blocking; run in a goroutine
-```
-
-### Shutting down
-
-```go
-srv.Close()
 ```
 
 ---
 
 ### Event handlers
 
-#### OnConnect
-
-Called when a client successfully connects to a namespace.
-Return a non-nil error to reject the connection.
+#### OnConnect — called when a client connects
 
 ```go
-srv.OnConnect("/", func(c gsocketio.Conn) error {
-    if !isAuthorised(c) {
-        return errors.New("not authorised")   // client receives CONNECT_ERROR
-    }
-    c.SetContext(loadUser(c.ID()))
-    return nil
+srv.OnConnect("/", func(c sio.Conn) error {
+    log.Println("connected:", c.ID())
+    c.Join("lobby")
+    return nil  // return error to reject the connection
 })
 ```
 
-#### OnDisconnect
+#### OnDisconnect — called when a client disconnects
 
 ```go
-srv.OnDisconnect("/", func(c gsocketio.Conn, reason string) {
-    fmt.Println(c.ID(), "disconnected:", reason)
+srv.OnDisconnect("/", func(c sio.Conn, reason string) {
+    log.Println("disconnected:", c.ID(), reason)
 })
 ```
 
-#### OnError
+#### OnError — called on protocol errors
 
 ```go
-srv.OnError("/", func(c gsocketio.Conn, err error) {
-    log.Println("socket error:", err)
+srv.OnError("/", func(c sio.Conn, err error) {
+    log.Println("error:", err)
 })
 ```
 
-#### OnEvent
+#### OnEvent — called when a client sends an event
 
 ```go
-// fn signature: func(c gsocketio.Conn, args []json.RawMessage)
-srv.OnEvent("/", "message", func(c gsocketio.Conn, args []json.RawMessage) {
-    var text string
-    json.Unmarshal(args[0], &text)
-    // args[1], args[2] … for multiple arguments
+srv.OnEvent("/", "chat", func(c sio.Conn, args []json.RawMessage) {
+    var msg string
+    json.Unmarshal(args[0], &msg)
+    log.Println("message:", msg)
 })
 ```
 
-Unmarshalling a struct argument:
+Unmarshal a struct:
 
 ```go
-type ChatMsg struct {
+type Message struct {
     Room string `json:"room"`
     Text string `json:"text"`
 }
-srv.OnEvent("/", "chat", func(c gsocketio.Conn, args []json.RawMessage) {
-    var m ChatMsg
+
+srv.OnEvent("/", "chat", func(c sio.Conn, args []json.RawMessage) {
+    var m Message
     json.Unmarshal(args[0], &m)
-    fmt.Println(m.Room, m.Text)
+    log.Println(m.Room, m.Text)
 })
 ```
 
 ---
 
-### The Conn interface
-
-```go
-type Conn interface {
-    ID()        string            // unique session id
-    Namespace() string            // e.g. "/"
-    Emit(event string, args ...interface{}) error
-    Join(room string)
-    Leave(room string)
-    Rooms() []string
-    Context() interface{}
-    SetContext(v interface{})
-    Close() error
-}
-```
-
-#### Sending events
+### Sending events to the client
 
 ```go
 c.Emit("ping")
 c.Emit("welcome", "Hello!")
 c.Emit("data", map[string]int{"count": 42})
-c.Emit("multi", "arg1", 2, true)   // multiple args
+c.Emit("multi", "arg1", 2, true)
 ```
-
-#### Context — storing per-connection data
-
-```go
-srv.OnConnect("/", func(c gsocketio.Conn) error {
-    c.SetContext(&UserSession{ID: parseToken(c)})
-    return nil
-})
-
-srv.OnEvent("/", "profile", func(c gsocketio.Conn, _ []json.RawMessage) {
-    sess := c.Context().(*UserSession)
-    c.Emit("profile", sess)
-})
-```
-
----
-
-### Namespaces
-
-Register handlers on any namespace:
-
-```go
-// Root namespace
-srv.OnConnect("/", handlerFn)
-srv.OnEvent("/", "event", handlerFn)
-
-// Custom namespace — clients must connect to "/admin" explicitly
-srv.OnConnect("/admin", handlerFn)
-srv.OnEvent("/admin", "shutdown", handlerFn)
-```
-
-Clients connect to a namespace by sending a CONNECT packet with the namespace
-name in the Socket.IO handshake.
 
 ---
 
 ### Rooms
 
-Connections can join multiple rooms. Rooms are created lazily and cleaned up
-when empty.
-
 ```go
-// In a handler:
+// Join / leave from inside a handler
 c.Join("room-name")
 c.Leave("room-name")
-rooms := c.Rooms()   // []string of current rooms
+rooms := c.Rooms()  // []string
 
-// Server-side room management:
+// Server-side room management
 srv.JoinRoom("/", "room", c)
 srv.LeaveRoom("/", "room", c)
 srv.LeaveAllRooms("/", c)
-srv.ClearRoom("/", "room")           // remove all members
+srv.ClearRoom("/", "room")
 
-n     := srv.RoomLen("/", "room")    // member count
-names := srv.Rooms("/")              // all room names in namespace
-conns := srv.RoomMembers("/", "room") // []Conn
-srv.ForEachInRoom("/", "room", func(c Conn) { … })
+// Query
+n     := srv.RoomLen("/", "room")       // member count
+names := srv.Rooms("/")                 // all room names
+conns := srv.RoomMembers("/", "room")   // []Conn
+
+// Iterate
+srv.ForEachInRoom("/", "room", func(c sio.Conn) {
+    c.Emit("ping")
+})
 ```
 
 ---
@@ -264,14 +202,48 @@ srv.ForEachInRoom("/", "room", func(c Conn) { … })
 ### Broadcasting
 
 ```go
-// Everyone in a room (skip sender):
+// To a room — skip sender
 srv.ToRoom("/", "lobby", "chat", c, message)
 
-// Everyone in a room (no skip):
-srv.ToRoom("/", "lobby", "announcement", nil, "Server restart in 5 min")
+// To a room — include everyone
+srv.ToRoom("/", "lobby", "alert", nil, "Server restarting")
 
-// Everyone connected to a namespace (all rooms):
+// To all connections in a namespace
 srv.ToNamespace("/", "alert", "Something happened")
+```
+
+---
+
+### Context — store data per connection
+
+```go
+srv.OnConnect("/", func(c sio.Conn) error {
+    c.SetContext("user-data-here")
+    return nil
+})
+
+srv.OnEvent("/", "profile", func(c sio.Conn, _ []json.RawMessage) {
+    data := c.Context().(string)
+    c.Emit("profile", data)
+})
+```
+
+---
+
+### Namespaces
+
+```go
+// Root namespace
+srv.OnConnect("/", func(c sio.Conn) error { return nil })
+srv.OnEvent("/", "ping", func(c sio.Conn, _ []json.RawMessage) {
+    c.Emit("pong", "ok")
+})
+
+// Custom namespace
+srv.OnConnect("/admin", func(c sio.Conn) error { return nil })
+srv.OnEvent("/admin", "shutdown", func(c sio.Conn, _ []json.RawMessage) {
+    srv.ToNamespace("/", "alert", "Shutting down!")
+})
 ```
 
 ---
@@ -279,48 +251,108 @@ srv.ToNamespace("/", "alert", "Something happened")
 ### Connection count
 
 ```go
-n := srv.Count()   // live connections across all namespaces
+n := srv.Count()  // all live connections across all namespaces
 ```
 
 ---
 
-## Connecting from a browser
+### Reject a connection
 
-The server speaks Socket.IO v4 over WebSocket. Connect with the official
-`socket.io-client` library **or** use a raw WebSocket with the EIO4 framing:
-
-```js
-// Using official socket.io-client (CDN):
-// <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
-const socket = io("http://localhost:8080");
-socket.on("connect", () => console.log("connected:", socket.id));
-socket.emit("chat", { room: "lobby", text: "Hello!" });
-socket.on("chat", (msg) => console.log(msg));
+```go
+srv.OnConnect("/", func(c sio.Conn) error {
+    if !isAuthenticated(c) {
+        return errors.New("unauthorized")  // sends CONNECT_ERROR to client
+    }
+    return nil
+})
 ```
 
-Raw WebSocket (no library):
+---
 
-```js
-const ws = new WebSocket(
-  "ws://localhost:8080/socket.io/?EIO=4&transport=websocket",
-);
+### Close a connection from the server
 
-ws.onmessage = (e) => {
-  const type = e.data[0];
-  if (type === "0") {
-    ws.send("0");
-    return;
-  } // EIO open → SIO connect
-  if (e.data[0] === "2") {
-    // SIO event
-    const [event, ...args] = JSON.parse(e.data.slice(1));
-    console.log(event, args);
+```go
+srv.OnEvent("/", "kick", func(c sio.Conn, _ []json.RawMessage) {
+    c.Emit("kicked", "goodbye")
+    c.Close()
+})
+```
+
+---
+
+## Part 3 — Browser Client
+
+### With socket.io-client (recommended)
+
+```html
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<script>
+  const socket = io("http://localhost:8080");
+
+  socket.on("connect", () => console.log("id:", socket.id));
+  socket.on("welcome", (msg) => console.log(msg));
+  socket.on("chat", (msg) => console.log(msg));
+  socket.on("disconnect", () => console.log("disconnected"));
+
+  socket.emit("chat", "Hello from browser!");
+  socket.emit("join", "sports");
+</script>
+```
+
+### With raw WebSocket (no library)
+
+```html
+<script>
+  const ws = new WebSocket(
+    "ws://localhost:8080/socket.io/?EIO=4&transport=websocket",
+  );
+  let ready = false;
+
+  ws.onmessage = (e) => {
+    if (e.data[0] === "0") {
+      ws.send("0");
+      return;
+    } // EIO open → SIO connect
+    if (e.data === "0") {
+      ready = true;
+      return;
+    } // SIO connect ack
+    if (e.data[0] === "2") {
+      const [event, ...args] = JSON.parse(e.data.slice(1));
+      console.log(event, args);
+    }
+  };
+
+  function emit(event, ...args) {
+    if (ready) ws.send("2" + JSON.stringify([event, ...args]));
   }
-};
 
-function emit(event, ...args) {
-  ws.send("2" + JSON.stringify([event, ...args]));
-}
+  // Usage
+  emit("chat", "Hello!");
+  emit("join", "sports");
+</script>
+```
+
+---
+
+## Part 4 — Updating the Package
+
+When you fix bugs or add features:
+
+```bash
+# In the gsocketio/ folder
+git add .
+git commit -m "fix: your change description"
+git push
+
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+Then in any project that uses it:
+
+```bash
+go get github.com/shishir1290/gsocketio@v1.0.1
 ```
 
 ---
@@ -358,74 +390,27 @@ gsocketio/
 
 ---
 
-## Running the tests
+## Quick Reference
 
-```bash
-go test ./...
-```
-
-Expected output:
-
-```
-ok  gsocketio/packet     29 tests
-ok  gsocketio/rooms      28 tests
-ok  gsocketio/transport  13 tests
-ok  gsocketio/tests      21 tests
-```
-
-**71 tests total, zero external dependencies.**
+| What                | Command                                             |
+| ------------------- | --------------------------------------------------- |
+| Install             | `go get github.com/shishir1290/gsocketio@v1.0.0`    |
+| Install latest      | `go get github.com/shishir1290/gsocketio@latest`    |
+| Update version      | `go get github.com/shishir1290/gsocketio@v1.0.1`    |
+| Tag new release     | `git tag v1.0.1 && git push origin v1.0.1`          |
+| Source code         | https://github.com/shishir1290/gsocketio            |
+| Auto-generated docs | https://pkg.go.dev/github.com/shishir1290/gsocketio |
 
 ---
 
-## Running the examples
+## go.mod example
 
-```bash
-# Chat demo (open http://localhost:8080 in two tabs)
-go run examples/chat/main.go
+After running `go get`, your project's `go.mod` will look like:
 
-# API showcase (http://localhost:9000)
-go run examples/basic/main.go
 ```
+module github.com/shishir1290/my-app
 
----
+go 1.22
 
-## Architecture deep-dive
-
-### Layer 1 — `transport`
-
-Implements RFC 6455 (WebSocket) and HTTP long-poll from scratch:
-
-- `readFrame` / `writeFrame` — frame-level I/O with masking support
-- `WSConn` — bidirectional WebSocket connection (ping/pong auto-reply, close handshake)
-- `PollConn` — channel-backed pseudo-connection for HTTP long-poll
-- `Server.ServeHTTP` — HTTP entry point; routes to WS upgrade or poll handler
-
-### Layer 2 — `packet`
-
-Socket.IO v4 packet codec:
-
-- Five packet types: CONNECT, DISCONNECT, EVENT, ACK, CONNECT_ERROR
-- Namespace encoding (`/admin,`)
-- Ack ID encoding (decimal integer prefix)
-- `BuildEventData` / `EventName` / `EventArgs` helpers
-
-### Layer 3 — `rooms`
-
-Concurrent room manager:
-
-- Per-room `sync.RWMutex` for fine-grained locking
-- `snapshot()` pattern — copy member list before iterating (prevents deadlock)
-- `SendAll` deduplicates across rooms with a `seen` map
-
-### Layer 4 — `server`
-
-Wires everything together:
-
-- `readPump` — decode packets, dispatch events in goroutines
-- `writePump` — drain `sendCh` channel to transport
-- `teardown` — atomic close flag, room cleanup, OnDisconnect callback
-- `namespace` — per-namespace handler registry with `sync.RWMutex`
-
-### Layer 5 — `gsocketio`
-
-Thin facade that re-exports types so users only ever import `"gsocketio"`.
+require github.com/shishir1290/gsocketio v1.0.0
+```
