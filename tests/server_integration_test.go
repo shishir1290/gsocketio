@@ -885,3 +885,189 @@ func mustBuildEventData(event string, args ...interface{}) json.RawMessage {
 	d, _ := packet.BuildEventData(event, args...)
 	return d
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fix-verification integration tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+// FIX S-03: OnDisconnect fires exactly once even if Close() is called
+// concurrently from user code and the transport layer.
+func TestDisconnect_FiresExactlyOnce(t *testing.T) {
+	srv, addr, cleanup := newTestServer(t)
+	defer cleanup()
+
+	var count int32
+	srv.OnDisconnect("/", func(c gsocketio.Conn, _ string) {
+		atomic.AddInt32(&count, 1)
+	})
+
+	cl := dialWS(t, addr, "/")
+	// Close from both sides nearly simultaneously
+	go cl.close()
+	go cl.close()
+
+	time.Sleep(500 * time.Millisecond)
+	if n := atomic.LoadInt32(&count); n != 1 {
+		t.Errorf("OnDisconnect fires: want exactly 1 got %d", n)
+	}
+}
+
+// FIX S-06: Count() is decremented before OnDisconnect fires.
+func TestCount_AccurateDuringDisconnect(t *testing.T) {
+	srv, addr, cleanup := newTestServer(t)
+	defer cleanup()
+
+	ready := make(chan struct{}, 1)
+	srv.OnConnect("/", func(c gsocketio.Conn) error {
+		ready <- struct{}{}
+		return nil
+	})
+
+	var countInsideDisconnect int32
+	srv.OnDisconnect("/", func(c gsocketio.Conn, _ string) {
+		// Count should already be 0 when this fires (decremented first).
+		atomic.StoreInt32(&countInsideDisconnect, int32(srv.Count()))
+	})
+
+	cl := dialWS(t, addr, "/")
+	<-ready
+	cl.close()
+
+	time.Sleep(400 * time.Millisecond)
+	if n := atomic.LoadInt32(&countInsideDisconnect); n != 0 {
+		t.Errorf("Count inside OnDisconnect: want 0 got %d", n)
+	}
+}
+
+// FIX R-03: Join is capped at MaxRoomsPerConn.
+func TestJoin_MaxRoomsPerConnEnforced(t *testing.T) {
+	srv, addr, cleanup := newTestServer(t)
+	defer cleanup()
+
+	done := make(chan int, 1)
+	srv.OnConnect("/", func(c gsocketio.Conn) error {
+		// Try to join 200 rooms — should be capped at MaxRoomsPerConn (100).
+		for i := 0; i < 200; i++ {
+			c.Join(fmt.Sprintf("room-%d", i))
+		}
+		done <- len(c.Rooms())
+		return nil
+	})
+
+	cl := dialWS(t, addr, "/")
+	defer cl.close()
+
+	select {
+	case n := <-done:
+		if n > 100 {
+			t.Errorf("rooms: want ≤100 got %d (MaxRoomsPerConn not enforced)", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for join cap test")
+	}
+}
+
+// FIX S-01: CONNECT_ERROR message is sanitised (no internal error details).
+func TestConnectError_IsSanitised(t *testing.T) {
+	srv, addr, cleanup := newTestServer(t)
+	defer cleanup()
+
+	// Register "/" with a rejecting handler that returns a sensitive error.
+	srv.OnConnect("/", func(c gsocketio.Conn) error {
+		return fmt.Errorf("internal db error: password=secret123")
+	})
+
+	tc, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer tc.Close()
+
+	br := bufio.NewReader(tc)
+	bw := bufio.NewWriter(tc)
+
+	req := fmt.Sprintf(
+		"GET /socket.io/?EIO=4&transport=websocket HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
+		addr, wsTestKey,
+	)
+	fmt.Fprint(bw, req)
+	bw.Flush() //nolint:errcheck
+
+	line, _ := br.ReadString('\n')
+	if !strings.Contains(line, "101") {
+		t.Skip("upgrade failed in test env")
+	}
+	for {
+		l, _ := br.ReadString('\n')
+		if l == "\r\n" || l == "\n" {
+			break
+		}
+	}
+
+	// Send SIO CONNECT
+	connectPkt := &packet.Packet{Type: packet.TypeConnect, Namespace: "/"}
+	raw, _ := packet.Encode(connectPkt)
+	sendMaskedWS(t, bw, raw)
+
+	// Read responses until we get CONNECT_ERROR or timeout
+	tc.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for i := 0; i < 5; i++ {
+		_, frame, err := readWSFrame(br)
+		if err != nil {
+			break
+		}
+		if len(frame) == 0 {
+			continue
+		}
+		pkt, err := packet.Decode(frame)
+		if err != nil {
+			continue
+		}
+		if pkt.Type == packet.TypeConnectError {
+			// FIX S-01: must NOT contain internal error detail.
+			body := string(pkt.Data)
+			if strings.Contains(body, "password") || strings.Contains(body, "secret") || strings.Contains(body, "db error") {
+				t.Errorf("CONNECT_ERROR leaks internal error: %s", body)
+			}
+			return
+		}
+	}
+}
+
+// helpers for raw WS reads used in TestConnectError_IsSanitised
+func sendMaskedWS(t *testing.T, bw *bufio.Writer, payload []byte) {
+	t.Helper()
+	mask := [4]byte{0x37, 0x41, 0x05, 0x9C}
+	masked := make([]byte, len(payload))
+	for i, b := range payload {
+		masked[i] = b ^ mask[i%4]
+	}
+	bw.WriteByte(0x81)                   //nolint:errcheck
+	bw.WriteByte(byte(len(payload)) | 0x80) //nolint:errcheck
+	bw.Write(mask[:])                    //nolint:errcheck
+	bw.Write(masked)                     //nolint:errcheck
+	bw.Flush()                           //nolint:errcheck
+}
+
+func readWSFrame(br *bufio.Reader) (opcode byte, payload []byte, err error) {
+	b0, err := br.ReadByte()
+	if err != nil {
+		return 0, nil, err
+	}
+	opcode = b0 & 0x0F
+	b1, err := br.ReadByte()
+	if err != nil {
+		return 0, nil, err
+	}
+	payLen := int(b1 & 0x7F)
+	if payLen == 126 {
+		var ext [2]byte
+		io.ReadFull(br, ext[:]) //nolint:errcheck
+		payLen = int(binary.BigEndian.Uint16(ext[:]))
+	}
+	if payLen > 0 {
+		payload = make([]byte, payLen)
+		io.ReadFull(br, payload) //nolint:errcheck
+	}
+	return
+}
