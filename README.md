@@ -1,7 +1,7 @@
 # gsocketio
 
 A **Socket.IO v4 server** for Go, written entirely from scratch using only the
-Go standard library.  No external packages, no GitHub forks — every byte of the
+Go standard library. No external packages, no GitHub forks — every byte of the
 WebSocket handshake, frame parser, packet codec, room manager and event
 dispatcher is hand-written.
 
@@ -9,17 +9,17 @@ dispatcher is hand-written.
 
 ## Why gsocketio?
 
-| | googollee/go-socket.io | gsocketio |
-|---|---|---|
-| External deps | gorilla/websocket, go-engine.io, … | **zero** |
-| WebSocket impl | third-party library | Pure stdlib RFC 6455 |
-| Socket.IO version | 1.x (archived) | **4.x (EIO 4)** |
-| Namespaces | ✅ | ✅ |
-| Rooms | ✅ | ✅ |
-| Ack callbacks | ✅ | ✅ |
-| Context per conn | ✅ | ✅ |
-| Thread-safe | ✅ | ✅ |
-| Module path | github.com/… | local module, zero deps |
+| Feature           | gsocketio               |
+| ----------------- | ----------------------- |
+| External deps     | **zero**                |
+| WebSocket impl    | Pure stdlib RFC 6455    |
+| Socket.IO version | **4.x (EIO 4)**         |
+| Namespaces        | ✅                      |
+| Rooms             | ✅                      |
+| Ack callbacks     | ✅                      |
+| Context per conn  | ✅                      |
+| Thread-safe       | ✅                      |
+| Module path       | local module, zero deps |
 
 ---
 
@@ -295,25 +295,31 @@ The server speaks Socket.IO v4 over WebSocket. Connect with the official
 const socket = io("http://localhost:8080");
 socket.on("connect", () => console.log("connected:", socket.id));
 socket.emit("chat", { room: "lobby", text: "Hello!" });
-socket.on("chat", msg => console.log(msg));
+socket.on("chat", (msg) => console.log(msg));
 ```
 
 Raw WebSocket (no library):
 
 ```js
-const ws = new WebSocket("ws://localhost:8080/socket.io/?EIO=4&transport=websocket");
+const ws = new WebSocket(
+  "ws://localhost:8080/socket.io/?EIO=4&transport=websocket",
+);
 
-ws.onmessage = e => {
-    const type = e.data[0];
-    if (type === '0') { ws.send('0'); return; }          // EIO open → SIO connect
-    if (e.data[0] === '2') {                             // SIO event
-        const [event, ...args] = JSON.parse(e.data.slice(1));
-        console.log(event, args);
-    }
+ws.onmessage = (e) => {
+  const type = e.data[0];
+  if (type === "0") {
+    ws.send("0");
+    return;
+  } // EIO open → SIO connect
+  if (e.data[0] === "2") {
+    // SIO event
+    const [event, ...args] = JSON.parse(e.data.slice(1));
+    console.log(event, args);
+  }
 };
 
 function emit(event, ...args) {
-    ws.send('2' + JSON.stringify([event, ...args]));
+  ws.send("2" + JSON.stringify([event, ...args]));
 }
 ```
 
