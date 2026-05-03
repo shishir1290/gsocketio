@@ -26,6 +26,19 @@ import (
 	"github.com/shishir1290/gsocketio/transport"
 )
 
+// eioMessage is the Engine.IO v4 "message" packet type prefix.
+// All Socket.IO packets must be wrapped with this byte when sent over the wire.
+// socket.io-client (JS/Flutter/Python/Java) all expect: "4" + SIO_packet
+const eioMessage = byte('4')
+
+// wrapEIO wraps a Socket.IO packet with the EIO "4" message prefix.
+func wrapEIO(sioPacket []byte) []byte {
+	out := make([]byte, len(sioPacket)+1)
+	out[0] = eioMessage
+	copy(out[1:], sioPacket)
+	return out
+}
+
 // MaxRoomsPerConn is the maximum number of rooms a single connection may join.
 // FIX R-03: prevents memory exhaustion from malicious clients.
 const MaxRoomsPerConn = 100
@@ -197,8 +210,10 @@ func (c *conn) enqueue(raw []byte) error {
 	if atomic.LoadUint32(&c.closed) == 1 {
 		return errors.New("gsocketio: connection already closed")
 	}
+	// Wrap with EIO "4" prefix — required by socket.io-client on all platforms
+	wrapped := wrapEIO(raw)
 	select {
-	case c.sendCh <- raw:
+	case c.sendCh <- wrapped:
 		return nil
 	default:
 		return errors.New("gsocketio: send buffer full")
@@ -448,6 +463,10 @@ func (s *Server) handleConn(tc transport.Conn) {
 		return
 	}
 
+	// Transport layer strips EIO "4" prefix for us (handleEIO in WSConn).
+	// But poll connections pass raw bytes — strip manually if needed.
+	raw = stripEIO(raw)
+
 	pkt, err := packet.Decode(raw)
 	if err != nil {
 		logger.Error("handleConn: decode first packet: %v", err)
@@ -475,7 +494,7 @@ func (s *Server) handleConn(tc transport.Conn) {
 				Data: mustMarshal(map[string]string{"message": "namespace not found"}),
 			}
 			if b, e2 := packet.Encode(errPkt); e2 == nil {
-				tc.WriteText(b) //nolint:errcheck
+				tc.WriteText(wrapEIO(b)) //nolint:errcheck
 			}
 			tc.Close()
 			return
@@ -491,7 +510,8 @@ func (s *Server) handleConn(tc transport.Conn) {
 
 	ackPkt := &packet.Packet{Type: packet.TypeConnect, Namespace: ns}
 	if b, e2 := packet.Encode(ackPkt); e2 == nil {
-		if err2 := tc.WriteText(b); err2 != nil {
+		// Wrap with EIO "4" prefix — socket.io-client expects "40" for CONNECT ack
+		if err2 := tc.WriteText(wrapEIO(b)); err2 != nil {
 			logger.Error("handleConn: send connect ack: %v", err2)
 		}
 	}
@@ -522,7 +542,7 @@ func (s *Server) sendConnectError(tc transport.Conn, ns, publicMsg string) {
 		Data:      mustMarshal(map[string]string{"message": publicMsg}),
 	}
 	if b, err := packet.Encode(errPkt); err == nil {
-		tc.WriteText(b) //nolint:errcheck
+		tc.WriteText(wrapEIO(b)) //nolint:errcheck
 	}
 }
 
@@ -536,6 +556,7 @@ func (s *Server) readPump(c *conn, n *namespace) {
 			return
 		}
 
+		raw = stripEIO(raw)
 		pkt, err := packet.Decode(raw)
 		if err != nil {
 			logger.Error("readPump %s: decode: %v", c.id, err)
@@ -653,6 +674,15 @@ func (s *Server) teardown(c *conn, n *namespace, reason string) {
 			disconnFn(c, reason)
 		}
 	})
+}
+
+// stripEIO removes the EIO "4" (message) prefix if present.
+// WSConn strips it automatically; PollConn passes raw bytes.
+func stripEIO(raw []byte) []byte {
+	if len(raw) > 0 && raw[0] == eioMessage {
+		return raw[1:]
+	}
+	return raw
 }
 
 func mustMarshal(v interface{}) json.RawMessage {

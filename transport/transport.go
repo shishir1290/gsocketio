@@ -1,11 +1,14 @@
 // Package transport implements the WebSocket (RFC 6455) and HTTP long-poll
-// transports from scratch using only the Go standard library.
+// transports from scratch, fully compatible with the Engine.IO v4 protocol
+// used by socket.io-client (JavaScript/React/Next.js), flutter_socket_io,
+// python-socketio, socket.io-client-java, and any standard WebSocket client.
 //
-// Fixes applied (from analysis report):
-//   T-01 — Enforce client frame masking; close with 1002 if unmasked
-//   T-02 — Enforce Sec-WebSocket-Version: 13; reject with HTTP 426 otherwise
-//   T-03 — Enforce MaxPayload before allocating the payload buffer
-//   T-04 — Propagate long-poll context cancellation errors
+// Cross-platform compatibility notes:
+//   - EIO4 heartbeat loop: server sends "2" (ping), expects "3" (pong)
+//   - If no pong arrives within PingTimeout, the connection is closed
+//   - socket.io-client handles reconnect automatically on close
+//   - All standard WebSocket libraries (ws, socket.io-client, websockets,
+//     okhttp, starscream, etc.) work because we speak plain RFC 6455
 package transport
 
 import (
@@ -26,7 +29,7 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Constants — WebSocket opcodes (RFC 6455 §5.2)
+// WebSocket opcodes (RFC 6455 §5.2)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const (
@@ -38,68 +41,107 @@ const (
 	OpPong         byte = 0xA
 )
 
-// wsGUID is the magic string defined in RFC 6455 §1.3.
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-// WriteDeadline is applied before every write to prevent goroutine leaks
-// caused by slow/unresponsive clients (fixes S-04).
+// WriteDeadline applied before every write — prevents goroutine leaks from slow clients.
 const WriteDeadline = 10 * time.Second
 
-// ErrUnmaskedFrame is returned when a client sends an unmasked frame.
-// RFC 6455 §5.1: server MUST close with status 1002 (protocol error).
-var ErrUnmaskedFrame = errors.New("transport: client sent unmasked frame (RFC 6455 §5.1)")
+// EIO packet bytes (Engine.IO v4 protocol)
+const (
+	eioOpen      = '0'
+	eioClose     = '1'
+	eioPing      = '2' // server → client heartbeat
+	eioPong      = '3' // client → server heartbeat reply
+	eioMessage   = '4' // wraps Socket.IO packets
+	eioUpgrade   = '5'
+	eioNoop      = '6'
+)
 
-// ErrPayloadTooLarge is returned when a frame exceeds MaxPayload.
-var ErrPayloadTooLarge = errors.New("transport: payload exceeds MaxPayload limit")
+var (
+	ErrUnmaskedFrame  = errors.New("transport: client sent unmasked frame (RFC 6455 §5.1)")
+	ErrPayloadTooLarge = errors.New("transport: payload exceeds MaxPayload limit")
+	ErrPingTimeout    = errors.New("transport: ping timeout — client did not pong")
+)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WebSocket handshake helpers
+// Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// wsAcceptKey computes Sec-WebSocket-Accept (RFC 6455 §4.2.2).
 func wsAcceptKey(clientKey string) string {
 	h := sha1.New()
 	h.Write([]byte(clientKey + wsGUID))
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
-// isWebSocketUpgrade reports whether r is a WebSocket upgrade request.
 func isWebSocketUpgrade(r *http.Request) bool {
 	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
+// NewSID generates a 22-character cryptographically random session ID.
+func NewSID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic("gsocketio: crypto/rand unavailable: " + err.Error())
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// WSConn — a single WebSocket connection
+// Options
 // ─────────────────────────────────────────────────────────────────────────────
 
-// WSConn is a full-duplex WebSocket connection backed by a net.Conn.
+type Options struct {
+	PingInterval time.Duration // how often server pings client (default 25s)
+	PingTimeout  time.Duration // how long to wait for pong before close (default 20s)
+	MaxPayload   int           // max frame payload bytes (default 1MB)
+}
+
+func (o *Options) defaults() {
+	if o.PingInterval == 0 { o.PingInterval = 25 * time.Second }
+	if o.PingTimeout == 0  { o.PingTimeout  = 20 * time.Second }
+	if o.MaxPayload == 0   { o.MaxPayload   = 1_000_000 }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WSConn — RFC 6455 WebSocket connection with EIO4 heartbeat
+// ─────────────────────────────────────────────────────────────────────────────
+
+// WSConn is a full-duplex WebSocket connection.
+// It runs an internal heartbeat goroutine that sends EIO "2" pings and
+// closes the connection if no "3" pong is received within PingTimeout.
+// This is what makes Flutter, React Native, and all other clients stable.
 type WSConn struct {
 	raw        net.Conn
 	rw         *bufio.ReadWriter
-	mu         sync.Mutex // guards writes
+	mu         sync.Mutex
 	closed     chan struct{}
 	once       sync.Once
 	maxPayload uint64
+
+	// heartbeat
+	pingInterval time.Duration
+	pingTimeout  time.Duration
+	pongCh       chan struct{} // receives signal when EIO pong arrives
 }
 
-// newWSConn wraps a raw TCP connection that has already been HTTP-upgraded.
-func newWSConn(raw net.Conn, rw *bufio.ReadWriter, maxPayload int) *WSConn {
-	return &WSConn{
-		raw:        raw,
-		rw:         rw,
-		closed:     make(chan struct{}),
-		maxPayload: uint64(maxPayload),
+func newWSConn(raw net.Conn, rw *bufio.ReadWriter, maxPayload int, opts Options) *WSConn {
+	c := &WSConn{
+		raw:          raw,
+		rw:           rw,
+		closed:       make(chan struct{}),
+		maxPayload:   uint64(maxPayload),
+		pingInterval: opts.PingInterval,
+		pingTimeout:  opts.PingTimeout,
+		pongCh:       make(chan struct{}, 1),
 	}
+	go c.heartbeatLoop()
+	return c
 }
 
-// RemoteAddr returns the peer's network address.
-func (c *WSConn) RemoteAddr() string { return c.raw.RemoteAddr().String() }
+func (c *WSConn) RemoteAddr() string     { return c.raw.RemoteAddr().String() }
+func (c *WSConn) Done() <-chan struct{}   { return c.closed }
 
-// Done returns a channel that is closed when the connection is closed.
-func (c *WSConn) Done() <-chan struct{} { return c.closed }
-
-// Close sends a Close frame and shuts down the underlying connection.
 func (c *WSConn) Close() error {
 	var err error
 	c.once.Do(func() {
@@ -114,8 +156,7 @@ func (c *WSConn) Close() error {
 	return err
 }
 
-// WriteText sends a complete UTF-8 text message.
-// FIX S-04: applies a write deadline before every write.
+// WriteText sends a WebSocket text frame.
 func (c *WSConn) WriteText(msg []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -126,8 +167,40 @@ func (c *WSConn) WriteText(msg []byte) error {
 	return c.rw.Flush()
 }
 
-// ReadMessage reads a complete message, handling continuation frames.
-// FIX T-01: rejects unmasked frames from clients with close code 1002.
+// heartbeatLoop sends EIO "2" pings every PingInterval.
+// If the client doesn't reply with EIO "3" within PingTimeout, closes the connection.
+// This is required for socket.io-client, flutter_socket_io, python-socketio, etc.
+func (c *WSConn) heartbeatLoop() {
+	ticker := time.NewTicker(c.pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.closed:
+			return
+		case <-ticker.C:
+			// Send EIO ping "2"
+			if err := c.WriteText([]byte{eioPing}); err != nil {
+				return
+			}
+			// Wait for EIO pong "3" within PingTimeout
+			select {
+			case <-c.pongCh:
+				// good — client is alive
+			case <-time.After(c.pingTimeout):
+				c.Close() //nolint:errcheck
+				return
+			case <-c.closed:
+				return
+			}
+		}
+	}
+}
+
+// ReadMessage reads a complete WebSocket message.
+// Handles EIO protocol bytes transparently:
+//   - EIO "3" (pong) → signals heartbeat, returns next real message
+//   - EIO "4" prefix  → strips it, returns the Socket.IO payload
+// This is what allows socket.io-client to work without modification.
 func (c *WSConn) ReadMessage() (byte, []byte, error) {
 	var assembled []byte
 	var msgOpcode byte
@@ -135,12 +208,10 @@ func (c *WSConn) ReadMessage() (byte, []byte, error) {
 	for {
 		fin, opcode, payload, err := readFrame(c.rw.Reader, c.maxPayload)
 		if err != nil {
-			// FIX T-01: if unmasked frame, send close 1002 before returning
 			if errors.Is(err, ErrUnmaskedFrame) {
 				c.mu.Lock()
 				c.raw.SetWriteDeadline(time.Now().Add(WriteDeadline)) //nolint:errcheck
-				// Close status 1002 = protocol error (2 byte big-endian)
-				_ = writeFrame(c.rw.Writer, OpClose, []byte{0x03, 0xEA})
+				_ = writeFrame(c.rw.Writer, OpClose, []byte{0x03, 0xEA}) // 1002
 				_ = c.rw.Flush()
 				c.mu.Unlock()
 			}
@@ -157,6 +228,7 @@ func (c *WSConn) ReadMessage() (byte, []byte, error) {
 			return OpClose, payload, io.EOF
 
 		case OpPing:
+			// WebSocket-level ping (not EIO ping) — auto-pong
 			c.mu.Lock()
 			c.raw.SetWriteDeadline(time.Now().Add(WriteDeadline)) //nolint:errcheck
 			_ = writeFrame(c.rw.Writer, OpPong, payload)
@@ -175,7 +247,13 @@ func (c *WSConn) ReadMessage() (byte, []byte, error) {
 
 		default: // Text or Binary
 			if fin {
-				return opcode, payload, nil
+				// Handle EIO protocol envelope transparently
+				data, err := c.handleEIO(payload)
+				if err != nil {
+					// EIO pong or noop — loop back for next message
+					continue
+				}
+				return opcode, data, nil
 			}
 			msgOpcode = opcode
 			assembled = append(assembled[:0], payload...)
@@ -183,102 +261,95 @@ func (c *WSConn) ReadMessage() (byte, []byte, error) {
 	}
 }
 
+// handleEIO processes EIO4 envelope bytes.
+// Returns the unwrapped payload, or error if the message was consumed internally.
+func (c *WSConn) handleEIO(payload []byte) ([]byte, error) {
+	if len(payload) == 0 {
+		return payload, nil
+	}
+	switch payload[0] {
+	case eioPong: // "3" — reply to our heartbeat ping
+		select {
+		case c.pongCh <- struct{}{}:
+		default:
+		}
+		return nil, errors.New("eio pong consumed")
+
+	case eioMessage: // "4" — Socket.IO packet, strip the "4" prefix
+		return payload[1:], nil
+
+	case eioPing: // "2" — client-initiated ping (some clients send this)
+		// Reply with pong
+		c.WriteText([]byte{eioPong}) //nolint:errcheck
+		return nil, errors.New("eio ping consumed")
+
+	case eioNoop: // "6"
+		return nil, errors.New("eio noop consumed")
+
+	default:
+		// No EIO envelope (raw Socket.IO packet) — pass through as-is
+		return payload, nil
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Frame-level I/O (RFC 6455 §5)
+// Frame I/O
 // ─────────────────────────────────────────────────────────────────────────────
 
-// readFrame reads one raw WebSocket frame.
-// FIX T-01: returns ErrUnmaskedFrame if client did not set MASK bit.
-// FIX T-03: rejects frames whose payload length exceeds maxPayload BEFORE
-//
-//	allocating memory.
 func readFrame(r *bufio.Reader, maxPayload uint64) (fin bool, opcode byte, payload []byte, err error) {
 	b0, err := r.ReadByte()
-	if err != nil {
-		return false, 0, nil, err
-	}
+	if err != nil { return false, 0, nil, err }
 	fin = (b0 & 0x80) != 0
 	opcode = b0 & 0x0F
 
 	b1, err := r.ReadByte()
-	if err != nil {
-		return false, 0, nil, err
-	}
+	if err != nil { return false, 0, nil, err }
 	masked := (b1 & 0x80) != 0
-
-	// FIX T-01 — RFC 6455 §5.1: all client frames MUST be masked.
-	if !masked {
-		return false, 0, nil, ErrUnmaskedFrame
-	}
+	if !masked { return false, 0, nil, ErrUnmaskedFrame }
 
 	payLen := uint64(b1 & 0x7F)
-
 	switch payLen {
 	case 126:
 		var ext [2]byte
-		if _, err = io.ReadFull(r, ext[:]); err != nil {
-			return
-		}
+		if _, err = io.ReadFull(r, ext[:]); err != nil { return }
 		payLen = uint64(binary.BigEndian.Uint16(ext[:]))
 	case 127:
 		var ext [8]byte
-		if _, err = io.ReadFull(r, ext[:]); err != nil {
-			return
-		}
+		if _, err = io.ReadFull(r, ext[:]); err != nil { return }
 		payLen = binary.BigEndian.Uint64(ext[:])
 	}
 
-	// FIX T-03 — check payload size BEFORE allocating memory.
 	if maxPayload > 0 && payLen > maxPayload {
 		return false, 0, nil, ErrPayloadTooLarge
 	}
 
 	var maskKey [4]byte
-	if _, err = io.ReadFull(r, maskKey[:]); err != nil {
-		return
-	}
+	if _, err = io.ReadFull(r, maskKey[:]); err != nil { return }
 
 	if payLen > 0 {
 		payload = make([]byte, payLen)
-		if _, err = io.ReadFull(r, payload); err != nil {
-			return
-		}
-		for i := range payload {
-			payload[i] ^= maskKey[i%4]
-		}
+		if _, err = io.ReadFull(r, payload); err != nil { return }
+		for i := range payload { payload[i] ^= maskKey[i%4] }
 	}
 	return
 }
 
-// writeFrame writes a single server-side WebSocket frame (unmasked, FIN=1).
 func writeFrame(w *bufio.Writer, opcode byte, payload []byte) error {
-	if err := w.WriteByte(0x80 | opcode); err != nil {
-		return err
-	}
+	if err := w.WriteByte(0x80 | opcode); err != nil { return err }
 	l := len(payload)
 	switch {
 	case l <= 125:
-		if err := w.WriteByte(byte(l)); err != nil {
-			return err
-		}
+		if err := w.WriteByte(byte(l)); err != nil { return err }
 	case l <= 65535:
-		if err := w.WriteByte(126); err != nil {
-			return err
-		}
+		if err := w.WriteByte(126); err != nil { return err }
 		var ext [2]byte
 		binary.BigEndian.PutUint16(ext[:], uint16(l))
-		if _, err := w.Write(ext[:]); err != nil {
-			return err
-		}
+		if _, err := w.Write(ext[:]); err != nil { return err }
 	default:
-		if err := w.WriteByte(127); err != nil {
-			return err
-		}
+		if err := w.WriteByte(127); err != nil { return err }
 		var ext [8]byte
 		binary.BigEndian.PutUint64(ext[:], uint64(l))
-		if _, err := w.Write(ext[:]); err != nil {
-			return err
-		}
+		if _, err := w.Write(ext[:]); err != nil { return err }
 	}
 	if len(payload) > 0 {
 		_, err := w.Write(payload)
@@ -288,10 +359,9 @@ func writeFrame(w *bufio.Writer, opcode byte, payload []byte) error {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PollConn — HTTP long-poll pseudo-connection
+// PollConn — HTTP long-poll (fallback transport for restrictive networks)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// PollConn simulates a persistent connection over HTTP GET/POST pairs.
 type PollConn struct {
 	id     string
 	addr   string
@@ -311,12 +381,10 @@ func newPollConn(id, addr string) *PollConn {
 	}
 }
 
-func (c *PollConn) ID() string         { return c.id }
-func (c *PollConn) RemoteAddr() string { return c.addr }
+func (c *PollConn) ID() string          { return c.id }
+func (c *PollConn) RemoteAddr() string  { return c.addr }
 func (c *PollConn) Done() <-chan struct{} { return c.closed }
 
-// WriteText queues a payload for the next GET poll.
-// FIX T-04: respects context via select on closed channel.
 func (c *PollConn) WriteText(p []byte) error {
 	select {
 	case c.sendCh <- p:
@@ -326,8 +394,6 @@ func (c *PollConn) WriteText(p []byte) error {
 	}
 }
 
-// ReadMessage blocks until the client POSTs data.
-// FIX T-04: returns error immediately if connection is already closed.
 func (c *PollConn) ReadMessage() (byte, []byte, error) {
 	select {
 	case p := <-c.recvCh:
@@ -337,17 +403,15 @@ func (c *PollConn) ReadMessage() (byte, []byte, error) {
 	}
 }
 
-// Close tears down the poll connection.
 func (c *PollConn) Close() error {
 	c.once.Do(func() { close(c.closed) })
 	return nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Conn — unified transport interface
+// Conn interface
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Conn is the interface both WSConn and PollConn satisfy.
 type Conn interface {
 	WriteText([]byte) error
 	ReadMessage() (opcode byte, payload []byte, err error)
@@ -357,43 +421,7 @@ type Conn interface {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Session ID generator — FIX S-02: always crypto/rand
-// ─────────────────────────────────────────────────────────────────────────────
-
-// NewSID generates a cryptographically random session identifier (22 chars).
-func NewSID() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		panic("gsocketio: crypto/rand unavailable: " + err.Error())
-	}
-	return base64.RawURLEncoding.EncodeToString(b)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Options
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Options configures the transport server.
-type Options struct {
-	PingInterval time.Duration
-	PingTimeout  time.Duration
-	MaxPayload   int
-}
-
-func (o *Options) defaults() {
-	if o.PingInterval == 0 {
-		o.PingInterval = 25 * time.Second
-	}
-	if o.PingTimeout == 0 {
-		o.PingTimeout = 20 * time.Second
-	}
-	if o.MaxPayload == 0 {
-		o.MaxPayload = 1_000_000
-	}
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Server
+// Server — HTTP handler + connection acceptor
 // ─────────────────────────────────────────────────────────────────────────────
 
 type openPacket struct {
@@ -404,7 +432,6 @@ type openPacket struct {
 	MaxPayload   int      `json:"maxPayload"`
 }
 
-// Server is an HTTP handler that upgrades connections and emits Conn values.
 type Server struct {
 	opts   Options
 	connCh chan Conn
@@ -412,19 +439,15 @@ type Server struct {
 	mu     sync.RWMutex
 	active map[string]Conn
 
-	closed chan struct{}
-	once   sync.Once
-
+	closed   chan struct{}
+	once     sync.Once
 	pollMu   sync.RWMutex
 	pollSess map[string]*PollConn
 }
 
-// NewServer creates a transport Server.
 func NewServer(opts *Options) *Server {
 	o := Options{}
-	if opts != nil {
-		o = *opts
-	}
+	if opts != nil { o = *opts }
 	o.defaults()
 	return &Server{
 		opts:     o,
@@ -435,7 +458,6 @@ func NewServer(opts *Options) *Server {
 	}
 }
 
-// Accept blocks until a new transport connection is ready.
 func (s *Server) Accept() (Conn, error) {
 	select {
 	case c := <-s.connCh:
@@ -445,28 +467,27 @@ func (s *Server) Accept() (Conn, error) {
 	}
 }
 
-// Remove deletes a session.
 func (s *Server) Remove(sid string) {
 	s.mu.Lock()
 	delete(s.active, sid)
 	s.mu.Unlock()
 }
 
-// Count returns active session count.
 func (s *Server) Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.active)
 }
 
-// Close shuts down the server.
 func (s *Server) Close() error {
 	s.once.Do(func() { close(s.closed) })
 	return nil
 }
 
-// ServeHTTP dispatches HTTP requests to the correct transport handler.
+// ServeHTTP is the HTTP entry point for all transports.
+// Clients connect to /socket.io/?EIO=4&transport=websocket
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// CORS — required for browser clients (React, Next.js, Flutter Web)
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -482,17 +503,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.servePoll(w, r)
 }
 
-// serveWebSocket performs the HTTP→WebSocket upgrade.
-// FIX T-02: rejects Sec-WebSocket-Version != 13 with HTTP 426.
 func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
-	// FIX T-02 — RFC 6455 §4.1: only version 13 is supported.
+	// RFC 6455 §4.1: only version 13 is supported
 	wsVersion := r.Header.Get("Sec-Websocket-Version")
 	if wsVersion != "13" {
 		w.Header().Set("Sec-WebSocket-Version", "13")
-		http.Error(w,
-			fmt.Sprintf("unsupported WebSocket version %q; only 13 is supported", wsVersion),
-			http.StatusUpgradeRequired, // 426
-		)
+		http.Error(w, "unsupported WebSocket version; only 13 supported", http.StatusUpgradeRequired)
 		return
 	}
 
@@ -509,16 +525,16 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	raw, brw, err := hj.Hijack()
 	if err != nil {
-		http.Error(w, "hijack failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	// Send 101 Switching Protocols
 	accept := wsAcceptKey(key)
-	handshake := "HTTP/1.1 101 Switching Protocols\r\n" +
+	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
-	if _, err = io.WriteString(brw, handshake); err != nil {
+	if _, err = io.WriteString(brw, resp); err != nil {
 		raw.Close()
 		return
 	}
@@ -528,8 +544,9 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sid := NewSID()
-	wsConn := newWSConn(raw, brw, s.opts.MaxPayload)
+	wsConn := newWSConn(raw, brw, s.opts.MaxPayload, s.opts)
 
+	// Send EIO open packet — socket.io-client expects this immediately
 	op, _ := json.Marshal(openPacket{
 		SID:          sid,
 		Upgrades:     []string{},
@@ -537,7 +554,8 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		PingTimeout:  int(s.opts.PingTimeout / time.Millisecond),
 		MaxPayload:   s.opts.MaxPayload,
 	})
-	if err = wsConn.WriteText(append([]byte("0"), op...)); err != nil {
+	// EIO4 open = "0" + JSON
+	if err = wsConn.WriteText(append([]byte{eioOpen}, op...)); err != nil {
 		wsConn.Close()
 		return
 	}
@@ -553,7 +571,6 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// pollSessions stores active long-poll sessions.
 var pollSessions sync.Map
 
 func (s *Server) servePoll(w http.ResponseWriter, r *http.Request) {
@@ -561,7 +578,6 @@ func (s *Server) servePoll(w http.ResponseWriter, r *http.Request) {
 	sid := r.URL.Query().Get("sid")
 
 	if r.Method == http.MethodPost {
-		// FIX T-04: check request context before processing.
 		if r.Context().Err() != nil {
 			http.Error(w, "request cancelled", http.StatusRequestTimeout)
 			return
@@ -585,18 +601,15 @@ func (s *Server) servePoll(w http.ResponseWriter, r *http.Request) {
 		sid = NewSID()
 		pc := newPollConn(sid, r.RemoteAddr)
 		pollSessions.Store(sid, pc)
-
 		s.mu.Lock()
 		s.active[sid] = pc
 		s.mu.Unlock()
-
 		select {
 		case s.connCh <- pc:
 		case <-s.closed:
 			pc.Close()
 			return
 		}
-
 		op, _ := json.Marshal(openPacket{
 			SID:          sid,
 			Upgrades:     []string{"websocket"},
@@ -604,7 +617,7 @@ func (s *Server) servePoll(w http.ResponseWriter, r *http.Request) {
 			PingTimeout:  int(s.opts.PingTimeout / time.Millisecond),
 			MaxPayload:   s.opts.MaxPayload,
 		})
-		fmt.Fprintf(w, "0%s", op)
+		fmt.Fprintf(w, "%c%s", eioOpen, op)
 		return
 	}
 
@@ -614,19 +627,16 @@ func (s *Server) servePoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pc := v.(*PollConn)
-
-	// FIX T-04: use request context to detect client disconnect mid-poll.
 	timer := time.NewTimer(s.opts.PingInterval)
 	defer timer.Stop()
 	select {
 	case payload := <-pc.sendCh:
 		w.Write(payload) //nolint:errcheck
 	case <-timer.C:
-		fmt.Fprint(w, "2")
+		fmt.Fprintf(w, "%c", eioPing)
 	case <-pc.closed:
-		fmt.Fprint(w, "1")
+		fmt.Fprintf(w, "%c", eioClose)
 	case <-r.Context().Done():
-		// FIX T-04: client disconnected mid-long-poll — clean up gracefully.
 		pc.Close()
 	}
 }
@@ -635,8 +645,9 @@ func (s *Server) servePoll(w http.ResponseWriter, r *http.Request) {
 // Test helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// NewWSConnForTest creates a WSConn from an existing net.Conn and ReadWriter.
-// Used only in tests.
 func NewWSConnForTest(raw net.Conn, rw *bufio.ReadWriter) *WSConn {
-	return newWSConn(raw, rw, 1_000_000)
+	return newWSConn(raw, rw, 1_000_000, Options{
+		PingInterval: 25 * time.Second,
+		PingTimeout:  20 * time.Second,
+	})
 }

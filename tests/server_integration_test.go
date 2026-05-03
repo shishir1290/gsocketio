@@ -84,7 +84,7 @@ func dialWS(t *testing.T, addr, ns string) *testClient {
 
 	cl := &testClient{t: t, conn: tc, br: br, bw: bw}
 
-	// Consume EIO open packet (server → client, unmasked).
+	// Consume EIO open packet "0{...}" (server → client, unmasked).
 	cl.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	_, eioRaw, err := cl.readServerFrame()
 	cl.conn.SetReadDeadline(time.Time{})
@@ -95,21 +95,24 @@ func dialWS(t *testing.T, addr, ns string) *testClient {
 		t.Fatalf("expected EIO open packet, got: %q", eioRaw)
 	}
 
-	// Send SIO CONNECT to namespace.
+	// Send SIO CONNECT wrapped with EIO "4" prefix → "40" or "40/chat,"
+	// This is exactly what socket.io-client sends.
 	connectPkt := &packet.Packet{Type: packet.TypeConnect, Namespace: ns}
-	raw, _ := packet.Encode(connectPkt)
-	cl.sendRaw(raw)
+	sioPkt, _ := packet.Encode(connectPkt)
+	cl.sendRaw(append([]byte{'4'}, sioPkt...)) // EIO "4" + SIO packet
 
-	// Consume SIO CONNECT ack.
+	// Consume SIO CONNECT ack — server sends "40" (EIO "4" + SIO "0")
 	cl.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	_, ackRaw, err := cl.readServerFrame()
 	cl.conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		t.Fatalf("read SIO connect ack: %v", err)
 	}
-	p, _ := packet.Decode(ackRaw)
+	// Strip EIO "4" prefix to get the SIO packet
+	ackSIO := stripEIOPrefix(ackRaw)
+	p, _ := packet.Decode(ackSIO)
 	if p == nil || p.Type != packet.TypeConnect {
-		t.Fatalf("expected SIO CONNECT ack, got: %q", ackRaw)
+		t.Fatalf("expected SIO CONNECT ack, got raw: %q stripped: %q", ackRaw, ackSIO)
 	}
 
 	return cl
@@ -173,39 +176,62 @@ func (cl *testClient) sendRaw(payload []byte) {
 	cl.bw.Flush()         //nolint:errcheck
 }
 
-// sendPacket encodes a packet and sends it.
+// sendPacket encodes a SIO packet, wraps it with EIO "4" prefix, and sends it.
+// This matches what socket.io-client does on all platforms.
 func (cl *testClient) sendPacket(p *packet.Packet) {
 	raw, err := packet.Encode(p)
 	if err != nil {
 		cl.t.Fatalf("encode packet: %v", err)
 	}
-	cl.sendRaw(raw)
+	// Wrap with EIO message prefix "4" — required for all SIO packets
+	cl.sendRaw(append([]byte{'4'}, raw...))
 }
 
 // recvPacket reads one SIO packet from the server with a timeout.
+// Handles EIO heartbeat pings transparently (replies with pong, reads next frame).
 func (cl *testClient) recvPacket(timeout time.Duration) (*packet.Packet, error) {
-	type result struct {
-		pkt *packet.Packet
-		err error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		cl.conn.SetReadDeadline(time.Now().Add(timeout))
-		_, raw, err := cl.readServerFrame()
-		cl.conn.SetReadDeadline(time.Time{})
-		if err != nil {
-			ch <- result{nil, err}
-			return
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("recvPacket: timed out after %v", timeout)
 		}
-		pkt, err := packet.Decode(raw)
-		ch <- result{pkt, err}
-	}()
-	select {
-	case r := <-ch:
-		return r.pkt, r.err
-	case <-time.After(timeout + 500*time.Millisecond):
-		return nil, fmt.Errorf("recvPacket: timed out after %v", timeout)
+		type result struct {
+			raw []byte
+			err error
+		}
+		ch := make(chan result, 1)
+		go func() {
+			cl.conn.SetReadDeadline(time.Now().Add(remaining))
+			_, raw, err := cl.readServerFrame()
+			cl.conn.SetReadDeadline(time.Time{})
+			ch <- result{raw, err}
+		}()
+		r := <-ch
+		if r.err != nil {
+			return nil, r.err
+		}
+		// Handle EIO heartbeat ping "2" — reply with pong "3", then read next frame
+		if len(r.raw) == 1 && r.raw[0] == '2' {
+			cl.sendRaw([]byte{'3'}) // EIO pong
+			continue
+		}
+		// Strip EIO "4" message prefix
+		sio := stripEIOPrefix(r.raw)
+		pkt, err := packet.Decode(sio)
+		if err != nil {
+			return nil, err
+		}
+		return pkt, nil
 	}
+}
+
+// stripEIOPrefix removes the EIO "4" (message) prefix if present.
+func stripEIOPrefix(raw []byte) []byte {
+	if len(raw) > 0 && raw[0] == '4' {
+		return raw[1:]
+	}
+	return raw
 }
 
 func (cl *testClient) close() { cl.conn.Close() } //nolint:errcheck
