@@ -122,7 +122,7 @@ type WSConn struct {
 	// heartbeat
 	pingInterval time.Duration
 	pingTimeout  time.Duration
-	pongCh       chan struct{} // receives signal when EIO pong arrives
+	pingCh       chan struct{} // receives signal when EIO ping arrives from client
 }
 
 func newWSConn(raw net.Conn, rw *bufio.ReadWriter, maxPayload int, opts Options) *WSConn {
@@ -133,9 +133,9 @@ func newWSConn(raw net.Conn, rw *bufio.ReadWriter, maxPayload int, opts Options)
 		maxPayload:   uint64(maxPayload),
 		pingInterval: opts.PingInterval,
 		pingTimeout:  opts.PingTimeout,
-		pongCh:       make(chan struct{}, 1),
+		pingCh:       make(chan struct{}, 1),
 	}
-	go c.heartbeatLoop()
+	go c.watchdogLoop()
 	return c
 }
 
@@ -170,28 +170,32 @@ func (c *WSConn) WriteText(msg []byte) error {
 // heartbeatLoop sends EIO "2" pings every PingInterval.
 // If the client doesn't reply with EIO "3" within PingTimeout, closes the connection.
 // This is required for socket.io-client, flutter_socket_io, python-socketio, etc.
-func (c *WSConn) heartbeatLoop() {
-	ticker := time.NewTicker(c.pingInterval)
-	defer ticker.Stop()
+// watchdogLoop waits for client-initiated EIO "2" pings.
+// If no ping arrives within PingInterval + PingTimeout, it closes the connection.
+// This is required by Engine.IO v4 (Socket.IO v3/v4).
+func (c *WSConn) watchdogLoop() {
+	// EIO4: client pings every PingInterval.
+	// We allow a grace period of PingTimeout.
+	timeout := c.pingInterval + c.pingTimeout
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	for {
 		select {
 		case <-c.closed:
 			return
-		case <-ticker.C:
-			// Send EIO ping "2"
-			if err := c.WriteText([]byte{eioPing}); err != nil {
-				return
+		case <-c.pingCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
-			// Wait for EIO pong "3" within PingTimeout
-			select {
-			case <-c.pongCh:
-				// good — client is alive
-			case <-time.After(c.pingTimeout):
-				c.Close() //nolint:errcheck
-				return
-			case <-c.closed:
-				return
-			}
+			timer.Reset(timeout)
+		case <-timer.C:
+			// No ping received in time
+			c.Close() //nolint:errcheck
+			return
 		}
 	}
 }
@@ -268,19 +272,29 @@ func (c *WSConn) handleEIO(payload []byte) ([]byte, error) {
 		return payload, nil
 	}
 	switch payload[0] {
-	case eioPong: // "3" — reply to our heartbeat ping
+	case eioPong: // "3" — client-sent pong (not standard in EIO4, but we'll accept it as activity)
 		select {
-		case c.pongCh <- struct{}{}:
+		case c.pingCh <- struct{}{}:
 		default:
 		}
 		return nil, errors.New("eio pong consumed")
 
 	case eioMessage: // "4" — Socket.IO packet, strip the "4" prefix
+		// Also reset watchdog on messages to be lenient during handshake
+		select {
+		case c.pingCh <- struct{}{}:
+		default:
+		}
 		return payload[1:], nil
 
-	case eioPing: // "2" — client-initiated ping (some clients send this)
-		// Reply with pong
+	case eioPing: // "2" — client-initiated ping (Standard in EIO4)
+		// Reply with pong "3"
 		c.WriteText([]byte{eioPong}) //nolint:errcheck
+		// Reset watchdog
+		select {
+		case c.pingCh <- struct{}{}:
+		default:
+		}
 		return nil, errors.New("eio ping consumed")
 
 	case eioNoop: // "6"

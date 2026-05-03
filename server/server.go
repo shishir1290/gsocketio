@@ -508,9 +508,13 @@ func (s *Server) handleConn(tc transport.Conn) {
 	s.connsMu.Unlock()
 	atomic.AddInt64(&s.connCount, 1)
 
-	ackPkt := &packet.Packet{Type: packet.TypeConnect, Namespace: ns}
+	ackPkt := &packet.Packet{
+		Type:      packet.TypeConnect,
+		Namespace: ns,
+		Data:      mustMarshal(map[string]string{"sid": c.id}),
+	}
 	if b, e2 := packet.Encode(ackPkt); e2 == nil {
-		// Wrap with EIO "4" prefix — socket.io-client expects "40" for CONNECT ack
+		// Wrap with EIO "4" prefix — socket.io-client expects "40{"sid":"..."}" for CONNECT ack
 		if err2 := tc.WriteText(wrapEIO(b)); err2 != nil {
 			logger.Error("handleConn: send connect ack: %v", err2)
 		}
