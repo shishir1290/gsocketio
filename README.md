@@ -30,7 +30,7 @@ dispatcher is hand-written.
 Inside any Go project folder:
 
 ```bash
-go get github.com/shishir1290/gsocketio@v1.0.0
+go get github.com/shishir1290/gsocketio@latest
 ```
 
 This updates your `go.mod` and creates `go.sum` automatically.
