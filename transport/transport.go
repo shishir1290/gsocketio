@@ -41,10 +41,10 @@ const (
 )
 
 var (
-	ErrUnmaskedFrame  = errors.New("transport: client sent unmasked frame")
+	ErrUnmaskedFrame   = errors.New("transport: client sent unmasked frame")
 	ErrPayloadTooLarge = errors.New("transport: payload exceeds MaxPayload limit")
-	ErrProtocol       = errors.New("transport: websocket protocol error")
-	ErrPingTimeout    = errors.New("transport: engine.io ping timeout")
+	ErrProtocol        = errors.New("transport: websocket protocol error")
+	ErrPingTimeout     = errors.New("transport: engine.io ping timeout")
 )
 
 type Options struct {
@@ -387,20 +387,19 @@ func writeFrame(w *bufio.Writer, op byte, p []byte) error {
 }
 
 type PollConn struct {
-	id, addr       string
-	sendCh, recvCh  chan []byte
-	closed         chan struct{}
-	once           sync.Once
+	id, addr      string
+	sendCh, recvCh chan []byte
+	closed        chan struct{}
+	once          sync.Once
 }
 
 func newPollConn(id, addr string) *PollConn {
 	return &PollConn{id: id, addr: addr, sendCh: make(chan []byte, 128), recvCh: make(chan []byte, 128), closed: make(chan struct{})}
 }
 
-func (c *PollConn) ID() string { return c.id }
-func (c *PollConn) RemoteAddr() string { return c.addr }
-func (c *PollConn) Done() <-chan struct{} { return c.closed }
-
+func (c *PollConn) ID() string                  { return c.id }
+func (c *PollConn) RemoteAddr() string          { return c.addr }
+func (c *PollConn) Done() <-chan struct{}       { return c.closed }
 func (c *PollConn) WriteText(p []byte) error {
 	select {
 	case c.sendCh <- append([]byte(nil), p...):
@@ -409,7 +408,6 @@ func (c *PollConn) WriteText(p []byte) error {
 		return errors.New("poll: connection closed")
 	}
 }
-
 func (c *PollConn) ReadMessage() (byte, []byte, error) {
 	select {
 	case p := <-c.recvCh:
@@ -418,7 +416,6 @@ func (c *PollConn) ReadMessage() (byte, []byte, error) {
 		return 0, nil, errors.New("poll: connection closed")
 	}
 }
-
 func (c *PollConn) Close() error {
 	c.once.Do(func() { close(c.closed) })
 	return nil
@@ -467,6 +464,7 @@ func (s *Server) Accept() (Conn, error) {
 	case <-s.closed:
 		return nil, errors.New("transport: server closed")
 	}
+}
 }
 
 func (s *Server) Remove(id string) {
@@ -633,7 +631,7 @@ func (s *Server) servePoll(w http.ResponseWriter, r *http.Request) {
 	}
 	if sid == "" {
 		sid = NewSID()
-		pc := newPollConn(sid, r.RemoteAddr())
+		pc := newPollConn(sid, r.RemoteAddr)
 		s.pollMu.Lock()
 		s.pollSess[sid] = pc
 		s.pollMu.Unlock()
