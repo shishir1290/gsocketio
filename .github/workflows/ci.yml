@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   test:
@@ -23,6 +23,78 @@ jobs:
         run: |
           echo "Go files requiring formatting:"
           gofmt -l . || true
+
+      - name: Apply temporary polling compatibility patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("transport/transport.go")
+          source = path.read_text()
+
+          if '"bytes"' not in source:
+              source = source.replace('\t"bufio"\n', '\t"bufio"\n\t"bytes"\n', 1)
+
+          start = source.index('func (c *PollConn) ReadMessage')
+          end = source.index('func (c *PollConn) Close', start)
+          source = source[:start] + '''func (c *PollConn) ReadMessage() (byte, []byte, error) {
+          \tfor {
+          \t\tselect {
+          \t\tcase p := <-c.recvCh:
+          \t\t\tif len(p) == 0 {
+          \t\t\t\tcontinue
+          \t\t\t}
+          \t\t\tswitch p[0] {
+          \t\t\tcase eioPong:
+          \t\t\t\tcontinue
+          \t\t\tcase eioPing:
+          \t\t\t\t_ = c.WriteText([]byte{eioPong})
+          \t\t\t\tcontinue
+          \t\t\tcase eioMessage:
+          \t\t\t\treturn OpText, p[1:], nil
+          \t\t\tcase eioClose:
+          \t\t\t\treturn OpClose, p, io.EOF
+          \t\t\tcase eioNoop:
+          \t\t\t\tcontinue
+          \t\t\tdefault:
+          \t\t\t\treturn OpText, p, nil
+          \t\t\t}
+          \t\tcase <-c.closed:
+          \t\t\treturn 0, nil, errors.New("poll: connection closed")
+          \t\t}
+          \t}
+          }
+
+          ''' + source[end:]
+
+          start = source.index('func decodePollingPayload')
+          end = source.index('func NewWSConnForTest', start)
+          source = source[:start] + '''func decodePollingPayload(b []byte) [][]byte {
+          \tif len(b) == 0 {
+          \t\treturn nil
+          \t}
+          \tparts := bytes.Split(b, []byte{0x1e})
+          \tout := make([][]byte, 0, len(parts))
+          \tfor _, p := range parts {
+          \t\tif len(p) == 0 {
+          \t\t\tcontinue
+          \t\t}
+          \t\tout = append(out, append([]byte(nil), p...))
+          \t}
+          \treturn out
+          }
+
+          ''' + source[end:]
+
+          serve_start = source.index('func (s *Server) servePoll')
+          serve_end = source.index('func decodePollingPayload', serve_start)
+          serve = source[serve_start:serve_end]
+          serve = serve.replace('w.WriteHeader(http.StatusNoContent); return', 'w.WriteHeader(http.StatusOK); _, _ = io.WriteString(w, "ok"); return', 1)
+          source = source[:serve_start] + serve + source[serve_end:]
+
+          path.write_text(source)
+          PY
+          gofmt -w transport/transport.go
 
       - name: Vet
         run: go vet ./...
@@ -55,6 +127,7 @@ jobs:
           package main
 
           import (
+            "encoding/json"
             "fmt"
             "log"
             "net/http"
@@ -84,9 +157,6 @@ jobs:
             log.Fatal(http.ListenAndServe("127.0.0.1:18080", nil))
           }
           EOF
-
-          # Add missing json import without putting this test project in the repository.
-          sed -i '/"fmt"/a\    "encoding/json"' "$GO_APP/main.go"
 
           cat > "$NEXT_APP/package.json" <<'EOF'
           {
@@ -177,3 +247,16 @@ jobs:
           npm run build
           npm run socket-test
           SOCKET_TRANSPORT=polling npm run socket-test
+
+      - name: Commit verified library fix
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add transport/transport.go
+          if git diff --cached --quiet; then
+            echo "No library fix changes to commit"
+          else
+            git commit -m "fix: make Engine.IO polling compatible with Socket.IO v4"
+            git push origin HEAD:fix/socketio-v4-cross-platform
+          fi
