@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main, fix/socketio-v4-cross-platform]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Check Go formatting
+        run: |
+          echo "Go files requiring formatting:"
+          gofmt -l . || true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Race test
+        run: go test -race ./...
