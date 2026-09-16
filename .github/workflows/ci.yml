@@ -32,3 +32,148 @@ jobs:
 
       - name: Race test
         run: go test -race ./...
+
+      - name: Integration test - Go server + Next.js Socket.IO client
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_ROOT="$(mktemp -d)"
+          GO_APP="$TEST_ROOT/go-server"
+          NEXT_APP="$TEST_ROOT/next-client"
+          mkdir -p "$GO_APP" "$NEXT_APP/app" "$NEXT_APP/scripts"
+
+          cat > "$GO_APP/go.mod" <<EOF
+          module integration-go-server
+
+          go 1.22.2
+
+          require github.com/shishir1290/gsocketio v0.0.0
+          replace github.com/shishir1290/gsocketio => $GITHUB_WORKSPACE
+          EOF
+
+          cat > "$GO_APP/main.go" <<'EOF'
+          package main
+
+          import (
+            "fmt"
+            "log"
+            "net/http"
+
+            "github.com/shishir1290/gsocketio"
+          )
+
+          func main() {
+            sio := gsocketio.New(nil)
+            sio.OnConnect("/", func(c gsocketio.Conn) error {
+              log.Printf("connected %s", c.ID())
+              return nil
+            })
+            sio.OnEvent("/", "ping", func(c gsocketio.Conn, args []json.RawMessage) {})
+            sio.OnDisconnect("/", func(c gsocketio.Conn, reason string) {
+              log.Printf("disconnected %s: %s", c.ID(), reason)
+            })
+
+            go func() {
+              if err := sio.Serve(); err != nil {
+                log.Printf("serve: %v", err)
+              }
+            }()
+
+            http.Handle("/socket.io/", sio)
+            fmt.Println("READY")
+            log.Fatal(http.ListenAndServe("127.0.0.1:18080", nil))
+          }
+          EOF
+
+          # Add missing json import without putting this test project in the repository.
+          sed -i '/"fmt"/a\    "encoding/json"' "$GO_APP/main.go"
+
+          cat > "$NEXT_APP/package.json" <<'EOF'
+          {
+            "private": true,
+            "scripts": { "build": "next build", "socket-test": "node scripts/socket-test.mjs" },
+            "dependencies": {
+              "next": "16.3.3",
+              "react": "19.2.0",
+              "react-dom": "19.2.0",
+              "socket.io-client": "4.8.3"
+            }
+          }
+          EOF
+
+          cat > "$NEXT_APP/app/layout.js" <<'EOF'
+          export default function RootLayout({ children }) {
+            return <html><body>{children}</body></html>
+          }
+          EOF
+
+          cat > "$NEXT_APP/app/page.js" <<'EOF'
+          "use client"
+
+          import { useEffect, useState } from "react"
+          import { io } from "socket.io-client"
+
+          export default function Home() {
+            const [status, setStatus] = useState("disconnected")
+            useEffect(() => {
+              const socket = io("http://127.0.0.1:18080", { transports: ["websocket"] })
+              socket.on("connect", () => setStatus("connected"))
+              socket.on("disconnect", () => setStatus("disconnected"))
+              return () => socket.close()
+            }, [])
+            return <main><h1>gsocketio integration</h1><p>{status}</p></main>
+          }
+          EOF
+
+          cat > "$NEXT_APP/scripts/socket-test.mjs" <<'EOF'
+          import { io } from "socket.io-client"
+
+          const transports = process.env.SOCKET_TRANSPORT === "polling"
+            ? ["polling"]
+            : ["websocket"]
+
+          const socket = io("http://127.0.0.1:18080", {
+            transports,
+            timeout: 5000,
+            reconnection: false,
+          })
+
+          const timeout = setTimeout(() => {
+            console.error("Socket.IO client timeout")
+            socket.close()
+            process.exit(1)
+          }, 10000)
+
+          socket.on("connect", () => {
+            console.log(`CONNECTED ${socket.id} via ${socket.io.engine.transport.name}`)
+            socket.emit("ping", { source: "nextjs-integration" }, () => {
+              clearTimeout(timeout)
+              console.log("ACK_RECEIVED")
+              socket.close()
+              process.exit(0)
+            })
+          })
+
+          socket.on("connect_error", (err) => {
+            console.error("CONNECT_ERROR", err.message)
+            clearTimeout(timeout)
+            socket.close()
+            process.exit(1)
+          })
+          EOF
+
+          (cd "$GO_APP" && go run . > "$TEST_ROOT/go-server.log" 2>&1) &
+          GO_PID=$!
+          trap 'kill "$GO_PID" 2>/dev/null || true; rm -rf "$TEST_ROOT"' EXIT
+
+          for i in {1..30}; do
+            if grep -q '^READY$' "$TEST_ROOT/go-server.log"; then break; fi
+            sleep 1
+          done
+          grep -q '^READY$' "$TEST_ROOT/go-server.log"
+
+          cd "$NEXT_APP"
+          npm install --no-audit --no-fund
+          npm run build
+          npm run socket-test
+          SOCKET_TRANSPORT=polling npm run socket-test
