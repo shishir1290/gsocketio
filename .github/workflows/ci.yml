@@ -23,6 +23,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("transport/transport.go")
+          s = p.read_text()
+          old = "default:return OpText,p,nil}}case<-c.closed:"
+          new = "default:return OpText,p,nil}}\ncase<-c.closed:"
+          if old in s:
+              p.write_text(s.replace(old, new, 1))
+          PY
           gofmt -w .
           if ! git diff --quiet; then
             git config user.name "github-actions[bot]"
