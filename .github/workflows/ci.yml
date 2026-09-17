@@ -97,11 +97,17 @@ jobs:
             panic(http.ListenAndServe("127.0.0.1:3000", nil))
           }
           EOF
+          go mod tidy
           go run . >/tmp/gsocketio-server.log 2>&1 & SERVER_PID=$!
           for i in $(seq 1 50); do
-            if curl -fsS 'http://127.0.0.1:3000/socket.io/?EIO=4&transport=polling' >/dev/null; then break; fi
+            if curl -fsS 'http://127.0.0.1:3000/socket.io/?EIO=4&transport=polling' >/dev/null 2>&1; then break; fi
             sleep .2
           done
+          if ! curl -fsS 'http://127.0.0.1:3000/socket.io/?EIO=4&transport=polling' >/dev/null 2>&1; then
+            echo "Server failed to start. Logs:"
+            cat /tmp/gsocketio-server.log || true
+            exit 1
+          fi
 
           cd "$TMP"
           mkdir -p next-app/app
