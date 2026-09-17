@@ -1,5 +1,5 @@
-// Package gsocketio is a Socket.IO v4 server for Go, built entirely from
-the Go standard library — no external dependencies whatsoever.
+// Package gsocketio is a Socket.IO v4 server for Go, built entirely from the
+// Go standard library — no external dependencies whatsoever.
 package gsocketio
 
 import (
@@ -40,10 +40,6 @@ func (s *Server) RoomLen(ns, room string) int { return s.inner.RoomLen(ns, room)
 func (s *Server) Rooms(ns string) []string { return s.inner.Rooms(ns) }
 func (s *Server) RoomMembers(ns, room string) []Conn { return s.inner.RoomMembers(ns, room) }
 func (s *Server) ForEachInRoom(ns, room string, fn func(Conn)) { s.inner.ForEachInRoom(ns, room, fn) }
-func (s *Server) ToRoom(ns, room, event string, skip Conn, args ...interface{}) {
-	s.inner.ToRoom(ns, room, event, skip, args...)
-}
-func (s *Server) ToNamespace(ns, event string, args ...interface{}) {
-	s.inner.ToNamespace(ns, event, args...)
-}
+func (s *Server) ToRoom(ns, room, event string, skip Conn, args ...interface{}) { s.inner.ToRoom(ns, room, event, skip, args...) }
+func (s *Server) ToNamespace(ns, event string, args ...interface{}) { s.inner.ToNamespace(ns, event, args...) }
 func Unmarshal(data json.RawMessage, v interface{}) error { return json.Unmarshal(data, v) }
