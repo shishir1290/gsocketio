@@ -23,14 +23,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if grep -q '^require ' go.mod; then
-            echo 'Unexpected external require directive found in go.mod'
-            exit 1
-          fi
-          if grep -R --include='*.go' -E '"(github\.com|golang\.org|golang\.google\.org|gopkg\.in)/' . --exclude-dir=.git | grep -v '"github.com/shishir1290/gsocketio'; then
-            echo 'Unexpected third-party Go import found'
-            exit 1
-          fi
+          modules="$(go list -m all)"
+          test "$(printf '%s\n' "$modules" | wc -l | tr -d ' ')" -eq 1
+          test "$(printf '%s\n' "$modules")" = "github.com/shishir1290/gsocketio"
 
       - name: Go format check
         shell: bash
