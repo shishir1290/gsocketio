@@ -1,6 +1,7 @@
 // Package logger provides a levelled logger for gsocketio.
 // FIX L-01: log level can be changed at runtime via GSOCKETIO_LOG_LEVEL env var.
-//   Accepted values: DEBUG, INFO, WARN, ERROR, SILENT
+//
+//	Accepted values: DEBUG, INFO, WARN, ERROR, SILENT
 package logger
 
 import (
@@ -15,7 +16,7 @@ import (
 type Level int32
 
 const (
-	LevelDebug  Level = iota
+	LevelDebug Level = iota
 	LevelInfo
 	LevelWarn
 	LevelError

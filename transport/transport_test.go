@@ -233,7 +233,7 @@ func TestReadMessage_MaxPayloadEnforced(t *testing.T) {
 	// the server should reject based on the declared length before reading body.
 	var frame []byte
 	frame = append(frame, 0x80|transport.OpText) // FIN + Text
-	frame = append(frame, 127|0x80)               // MASK + 8-byte extended length
+	frame = append(frame, 127|0x80)              // MASK + 8-byte extended length
 	var ext [8]byte
 	binary.BigEndian.PutUint64(ext[:], 2_000_000) // 2MB — exceeds 1MB default
 	frame = append(frame, ext[:]...)

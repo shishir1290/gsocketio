@@ -167,13 +167,13 @@ func (cl *testClient) sendRaw(payload []byte) {
 	case l <= 125:
 		cl.bw.WriteByte(byte(l) | 0x80) //nolint:errcheck
 	case l <= 65535:
-		cl.bw.WriteByte(126 | 0x80)      //nolint:errcheck
-		cl.bw.WriteByte(byte(l >> 8))    //nolint:errcheck
-		cl.bw.WriteByte(byte(l))         //nolint:errcheck
+		cl.bw.WriteByte(126 | 0x80)   //nolint:errcheck
+		cl.bw.WriteByte(byte(l >> 8)) //nolint:errcheck
+		cl.bw.WriteByte(byte(l))      //nolint:errcheck
 	}
-	cl.bw.Write(mask[:])  //nolint:errcheck
-	cl.bw.Write(masked)   //nolint:errcheck
-	cl.bw.Flush()         //nolint:errcheck
+	cl.bw.Write(mask[:]) //nolint:errcheck
+	cl.bw.Write(masked)  //nolint:errcheck
+	cl.bw.Flush()        //nolint:errcheck
 }
 
 // sendPacket encodes a SIO packet, wraps it with EIO "4" prefix, and sends it.
@@ -864,11 +864,11 @@ func TestUnregisteredNamespace_Rejected(t *testing.T) {
 	for i, b := range raw {
 		masked[i] = b ^ mask[i%4]
 	}
-	bw.WriteByte(0x81)            //nolint:errcheck
+	bw.WriteByte(0x81)                  //nolint:errcheck
 	bw.WriteByte(byte(len(raw)) | 0x80) //nolint:errcheck
-	bw.Write(mask[:])             //nolint:errcheck
-	bw.Write(masked)              //nolint:errcheck
-	bw.Flush()                    //nolint:errcheck
+	bw.Write(mask[:])                   //nolint:errcheck
+	bw.Write(masked)                    //nolint:errcheck
+	bw.Flush()                          //nolint:errcheck
 
 	// Wait briefly — server should close or send CONNECT_ERROR
 	time.Sleep(300 * time.Millisecond)
@@ -1068,11 +1068,11 @@ func sendMaskedWS(t *testing.T, bw *bufio.Writer, payload []byte) {
 	for i, b := range payload {
 		masked[i] = b ^ mask[i%4]
 	}
-	bw.WriteByte(0x81)                   //nolint:errcheck
+	bw.WriteByte(0x81)                      //nolint:errcheck
 	bw.WriteByte(byte(len(payload)) | 0x80) //nolint:errcheck
-	bw.Write(mask[:])                    //nolint:errcheck
-	bw.Write(masked)                     //nolint:errcheck
-	bw.Flush()                           //nolint:errcheck
+	bw.Write(mask[:])                       //nolint:errcheck
+	bw.Write(masked)                        //nolint:errcheck
+	bw.Flush()                              //nolint:errcheck
 }
 
 func readWSFrame(br *bufio.Reader) (opcode byte, payload []byte, err error) {

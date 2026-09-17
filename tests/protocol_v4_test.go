@@ -200,11 +200,11 @@ func sendFrame(bw *bufio.Writer, payload []byte) {
 	if l <= 125 {
 		bw.WriteByte(byte(l) | 0x80) //nolint:errcheck
 	} else {
-		bw.WriteByte(126 | 0x80) //nolint:errcheck
+		bw.WriteByte(126 | 0x80)   //nolint:errcheck
 		bw.WriteByte(byte(l >> 8)) //nolint:errcheck
 		bw.WriteByte(byte(l))      //nolint:errcheck
 	}
-	bw.Write(mask[:])   //nolint:errcheck
-	bw.Write(masked)    //nolint:errcheck
-	bw.Flush()          //nolint:errcheck
+	bw.Write(mask[:]) //nolint:errcheck
+	bw.Write(masked)  //nolint:errcheck
+	bw.Flush()        //nolint:errcheck
 }
