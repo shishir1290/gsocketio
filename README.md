@@ -1,5 +1,7 @@
 # gsocketio
 
+[![Website](https://img.shields.io/badge/website-gsocketio.vercel.app-blue)](https://gsocketio.vercel.app)
+
 `gsocketio` is a **pure-Go Socket.IO v4 server** for Go applications.
 
 It implements the Socket.IO protocol and Engine.IO v4 transport layer directly with the Go standard library. The library does **not** import Gorilla WebSocket, `nhooyr.io/websocket`, `gobwas/ws`, or any other third-party Go networking/Socket.IO package.
