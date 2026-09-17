@@ -27,3 +27,7 @@ vendor/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Documentation Website (Separate Repo)
+website/
+
