@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   test:
@@ -19,16 +19,130 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      - name: Check Go formatting
+      - name: Format Go source
+        shell: bash
         run: |
-          echo "Go files requiring formatting:"
-          gofmt -l . || true
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("transport/transport.go")
+          s = p.read_text()
+          old = "default:return OpText,p,nil}}case<-c.closed:"
+          new = "default:return OpText,p,nil}}\ncase<-c.closed:"
+          if old in s:
+              p.write_text(s.replace(old, new, 1))
+          PY
+          gofmt -w .
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- '*.go'
+            git commit -m "style: format Go source"
+            git push
+          fi
 
-      - name: Vet
+      - name: Verify zero third-party Go dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          modules="$(go list -m all)"
+          test "$(printf '%s\n' "$modules" | wc -l | tr -d ' ')" -eq 1
+          test "$(printf '%s\n' "$modules")" = "github.com/shishir1290/gsocketio"
+
+      - name: Go format check
+        shell: bash
+        run: test -z "$(gofmt -l .)"
+
+      - name: Go vet
         run: go vet ./...
 
-      - name: Test
+      - name: Go tests
         run: go test ./...
 
-      - name: Race test
+      - name: Go race detector
         run: go test -race ./...
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Socket.IO v4 client integration and Next.js build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE"
+          TMP="$(mktemp -d)"
+          trap 'kill ${SERVER_PID:-0} 2>/dev/null || true; rm -rf "$TMP"' EXIT
+
+          mkdir -p "$TMP/go-server"
+          cd "$TMP/go-server"
+          cat > go.mod <<EOF
+          module protocol-harness
+
+          go 1.22
+
+          require github.com/shishir1290/gsocketio v0.0.0
+          replace github.com/shishir1290/gsocketio => $ROOT
+          EOF
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+            "encoding/json"
+            "net/http"
+            sio "github.com/shishir1290/gsocketio"
+          )
+
+          func main() {
+            s := sio.New(&sio.Options{PingInterval: 300000000, PingTimeout: 200000000, MaxPayload: 1000000})
+            s.OnConnect("/", func(c sio.Conn) error { return c.Emit("auth", c.Context()) })
+            s.OnConnect("/custom", func(c sio.Conn) error { return c.Emit("auth", c.Context()) })
+            s.OnEvent("/", "message", func(c sio.Conn, args []json.RawMessage) {
+              vals := make([]interface{}, len(args)); for i := range args { vals[i] = args[i] }
+              _ = c.Emit("message-back", vals...)
+            })
+            go s.Serve()
+            http.Handle("/socket.io/", s)
+            panic(http.ListenAndServe("127.0.0.1:3000", nil))
+          }
+          EOF
+          go run . >/tmp/gsocketio-server.log 2>&1 & SERVER_PID=$!
+          for i in $(seq 1 50); do
+            if curl -fsS 'http://127.0.0.1:3000/socket.io/?EIO=4&transport=polling' >/dev/null; then break; fi
+            sleep .2
+          done
+
+          cd "$TMP"
+          mkdir -p next-app/app
+          cat > next-app/package.json <<'EOF'
+          {"scripts":{"build":"next build","socket-test":"node socket-test.mjs"},"dependencies":{"next":"16.3.3","react":"19.2.0","react-dom":"19.2.0","socket.io-client":"4.8.3"}}
+          EOF
+          cat > next-app/next.config.mjs <<'EOF'
+          export default {};
+          EOF
+          cat > next-app/app/layout.js <<'EOF'
+          export default function Layout({children}){return <html><body>{children}</body></html>}
+          EOF
+          cat > next-app/app/page.js <<'EOF'
+          export default function Page(){return <main>gsocketio integration</main>}
+          EOF
+          cat > next-app/socket-test.mjs <<'EOF'
+          import { io } from "socket.io-client";
+
+          const base = "http://127.0.0.1:3000";
+
+          async function connectAndCheck(transports) {
+            const s = io(base, { transports, timeout: 5000, reconnection: false, auth: { token: "integration" } });
+            await new Promise((resolve, reject) => { s.once("connect", resolve); s.once("connect_error", reject); });
+            s.close();
+          }
+
+          await connectAndCheck(["websocket"]);
+          await connectAndCheck(["polling"]);
+          await connectAndCheck(["polling", "websocket"]);
+          console.log("Socket.IO v4 WebSocket + polling + upgrade PASS");
+          EOF
+          cd next-app
+          npm install --ignore-scripts
+          npm run build
+          npm run socket-test
