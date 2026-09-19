@@ -53,6 +53,13 @@ jobs:
         shell: bash
         run: test -z "$(gofmt -l .)"
 
+      - name: Go doc API check
+        shell: bash
+        run: |
+          set -euo pipefail
+          go doc github.com/shishir1290/gsocketio/server Conn
+          go doc github.com/shishir1290/gsocketio/transport Options
+
       - name: Go vet
         run: go vet ./...
 
