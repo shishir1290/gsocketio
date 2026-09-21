@@ -111,26 +111,31 @@ func (mg *Manager) Join(roomName string, m Member) bool {
 
 // Leave removes m from roomName.
 // Returns false if the room or m was not found.
+// If the room becomes empty, it is removed from the manager.
 func (mg *Manager) Leave(roomName string, m Member) bool {
-	mg.mu.RLock()
+	mg.mu.Lock()
+	defer mg.mu.Unlock()
 	r, ok := mg.rooms[roomName]
-	mg.mu.RUnlock()
 	if !ok {
 		return false
 	}
-	return r.remove(m)
+	removed := r.remove(m)
+	if r.len() == 0 {
+		delete(mg.rooms, roomName)
+	}
+	return removed
 }
 
 // LeaveAll removes m from every room it belongs to.
+// Any room that becomes empty is removed from the manager.
 func (mg *Manager) LeaveAll(m Member) {
-	mg.mu.RLock()
-	rs := make([]*room, 0, len(mg.rooms))
-	for _, r := range mg.rooms {
-		rs = append(rs, r)
-	}
-	mg.mu.RUnlock()
-	for _, r := range rs {
+	mg.mu.Lock()
+	defer mg.mu.Unlock()
+	for name, r := range mg.rooms {
 		r.remove(m)
+		if r.len() == 0 {
+			delete(mg.rooms, name)
+		}
 	}
 }
 

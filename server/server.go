@@ -125,10 +125,24 @@ type conn struct {
 	ackMu      sync.Mutex
 	acks       map[uint64]AckFunc
 	binaryAcks map[uint64]BinaryAckFunc
+	eventSem   chan struct{}
 }
 
 func newConn(id, ns string, sess *engineSession, srv *Server) *conn {
-	return &conn{id: id, ns: ns, session: sess, srv: srv, joined: make(map[string]struct{}), acks: make(map[uint64]AckFunc), binaryAcks: make(map[uint64]BinaryAckFunc)}
+	var sem chan struct{}
+	if srv.opts.MaxEventConcurrency > 0 {
+		sem = make(chan struct{}, srv.opts.MaxEventConcurrency)
+	}
+	return &conn{
+		id:         id,
+		ns:         ns,
+		session:    sess,
+		srv:        srv,
+		joined:     make(map[string]struct{}),
+		acks:       make(map[uint64]AckFunc),
+		binaryAcks: make(map[uint64]BinaryAckFunc),
+		eventSem:   sem,
+	}
 }
 func (c *conn) ID() string               { return c.id }
 func (c *conn) Namespace() string        { return c.ns }
@@ -274,6 +288,7 @@ func (c *conn) EmitWithBinaryAck(event string, fn BinaryAckFunc, args ...interfa
 }
 
 type Server struct {
+	opts       transport.Options
 	tr         *transport.Server
 	nsMu       sync.RWMutex
 	namespaces map[string]*namespace
@@ -286,7 +301,14 @@ type Server struct {
 }
 
 func New(opts *transport.Options) *Server {
-	return &Server{tr: transport.NewServer(opts), namespaces: make(map[string]*namespace), conns: make(map[string]*conn), sessions: make(map[*engineSession]map[string]*conn)}
+	tr := transport.NewServer(opts)
+	return &Server{
+		opts:       tr.Options(),
+		tr:         tr,
+		namespaces: make(map[string]*namespace),
+		conns:      make(map[string]*conn),
+		sessions:   make(map[*engineSession]map[string]*conn),
+	}
 }
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.tr.ServeHTTP(w, r) }
 func (s *Server) Serve() error {
@@ -322,18 +344,27 @@ func (s *Server) OnBinaryEvent(ns, e string, f BinaryEventHandler) {
 	s.ensureNamespace(ns).setBinaryEvent(e, f)
 }
 func (s *Server) JoinRoom(ns, room string, c Conn) {
-	if n := s.namespace(ns); n != nil {
-		n.rooms.Join(room, c)
+	if c == nil || packet.NormalizeNS(c.Namespace()) != packet.NormalizeNS(ns) {
+		return
 	}
+	c.Join(room)
 }
 func (s *Server) LeaveRoom(ns, room string, c Conn) {
-	if n := s.namespace(ns); n != nil {
-		n.rooms.Leave(room, c)
+	if c == nil || packet.NormalizeNS(c.Namespace()) != packet.NormalizeNS(ns) {
+		return
 	}
+	c.Leave(room)
 }
 func (s *Server) LeaveAllRooms(ns string, c Conn) {
-	if n := s.namespace(ns); n != nil {
-		n.rooms.LeaveAll(c)
+	if c == nil || packet.NormalizeNS(c.Namespace()) != packet.NormalizeNS(ns) {
+		return
+	}
+	if cn, ok := c.(*conn); ok {
+		cn.leaveAll()
+	} else {
+		for _, r := range c.Rooms() {
+			c.Leave(r)
+		}
 	}
 }
 func (s *Server) ClearRoom(ns, room string) {
@@ -441,6 +472,12 @@ func (s *Server) handleSession(tc transport.Conn) {
 		if err != nil {
 			return
 		}
+		if !connectedAny {
+			if p.Type != packet.TypeConnect {
+				return
+			}
+			connectedAny = true
+		}
 		if p.Type.IsBinary() {
 			if p.Attachments > 64 {
 				return
@@ -449,10 +486,6 @@ func (s *Server) handleSession(tc transport.Conn) {
 			continue
 		}
 		s.dispatchPacket(sess, p, nil)
-		connectedAny = connectedAny || p.Type == packet.TypeConnect
-		if !connectedAny && p.Type != packet.TypeConnect {
-			return
-		}
 	}
 }
 
@@ -546,7 +579,19 @@ func (s *Server) dispatchEvent(sess *engineSession, n *namespace, p *packet.Pack
 		_, bf := n.getEvent(name)
 		if bf != nil {
 			if a, ok := v.([]interface{}); ok {
-				bf(c, a, p.ID)
+				if c.eventSem != nil {
+					select {
+					case c.eventSem <- struct{}{}:
+					case <-c.session.tr.Done():
+						return
+					}
+				}
+				go func() {
+					if c.eventSem != nil {
+						defer func() { <-c.eventSem }()
+					}
+					bf(c, a, p.ID)
+				}()
 			}
 			return
 		}
@@ -563,15 +608,24 @@ func (s *Server) dispatchEvent(sess *engineSession, n *namespace, p *packet.Pack
 		return
 	}
 	fn, _ := n.getEvent(name)
-	if fn != nil {
-		go fn(c, args)
-	}
-	if p.ID != nil {
+	if fn != nil || p.ID != nil {
+		if c.eventSem != nil {
+			select {
+			case c.eventSem <- struct{}{}:
+			case <-c.session.tr.Done():
+				return
+			}
+		}
 		go func() {
+			if c.eventSem != nil {
+				defer func() { <-c.eventSem }()
+			}
 			if fn != nil {
 				fn(c, args)
 			}
-			_ = c.emitAck(*p.ID)
+			if p.ID != nil {
+				_ = c.emitAck(*p.ID)
+			}
 		}()
 	}
 }

@@ -48,9 +48,14 @@ var (
 )
 
 type Options struct {
-	PingInterval time.Duration
-	PingTimeout  time.Duration
-	MaxPayload   int
+	PingInterval        time.Duration
+	PingTimeout         time.Duration
+	MaxPayload          int
+	AllowedOrigins      []string
+	CheckOrigin         func(r *http.Request) bool
+	MaxConnections      int
+	MaxConnectionsPerIP int
+	MaxEventConcurrency int
 }
 
 func (o *Options) defaults() {
@@ -62,6 +67,9 @@ func (o *Options) defaults() {
 	}
 	if o.MaxPayload <= 0 {
 		o.MaxPayload = 1_000_000
+	}
+	if o.MaxEventConcurrency <= 0 {
+		o.MaxEventConcurrency = 32
 	}
 }
 func NewSID() string {
@@ -415,9 +423,14 @@ func (c *PollConn) ID() string            { return c.id }
 func (c *PollConn) RemoteAddr() string    { return c.addr }
 func (c *PollConn) Done() <-chan struct{} { return c.closed }
 func (c *PollConn) WriteText(p []byte) error {
+	t := time.NewTimer(500 * time.Millisecond)
+	defer t.Stop()
 	select {
 	case c.sendCh <- append([]byte(nil), p...):
 		return nil
+	case <-t.C:
+		_ = c.Close()
+		return errors.New("poll: write timeout")
 	case <-c.closed:
 		return errors.New("poll: connection closed")
 	}
@@ -503,14 +516,26 @@ type Conn interface {
 }
 type binaryWriter interface{ WriteBinary([]byte) error }
 
+func extractIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
+}
+
 type sessionConn struct {
 	mu      sync.RWMutex
 	current Conn
 	done    chan struct{}
 	closed  atomic.Bool
+	ip      string
+	onClose func()
 }
 
-func newSessionConn(c Conn) *sessionConn { return &sessionConn{current: c, done: make(chan struct{})} }
+func newSessionConn(c Conn, ip string, onClose func()) *sessionConn {
+	return &sessionConn{current: c, done: make(chan struct{}), ip: ip, onClose: onClose}
+}
 func (s *sessionConn) RemoteAddr() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -557,6 +582,9 @@ func (s *sessionConn) Close() error {
 	err := c.Close()
 	if s.closed.CompareAndSwap(false, true) {
 		close(s.done)
+		if s.onClose != nil {
+			s.onClose()
+		}
 	}
 	return err
 }
@@ -580,6 +608,7 @@ type Server struct {
 	connCh   chan Conn
 	mu       sync.RWMutex
 	active   map[string]*sessionConn
+	ipCount  map[string]int
 	closed   chan struct{}
 	once     sync.Once
 	pollMu   sync.RWMutex
@@ -592,7 +621,56 @@ func NewServer(opts *Options) *Server {
 		o = *opts
 	}
 	o.defaults()
-	return &Server{opts: o, connCh: make(chan Conn, 64), active: make(map[string]*sessionConn), closed: make(chan struct{}), pollSess: make(map[string]*PollConn)}
+	return &Server{
+		opts:     o,
+		connCh:   make(chan Conn, 64),
+		active:   make(map[string]*sessionConn),
+		ipCount:  make(map[string]int),
+		closed:   make(chan struct{}),
+		pollSess: make(map[string]*PollConn),
+	}
+}
+func (s *Server) Options() Options {
+	return s.opts
+}
+func (s *Server) checkOrigin(r *http.Request) bool {
+	if s.opts.CheckOrigin != nil {
+		return s.opts.CheckOrigin(r)
+	}
+	if len(s.opts.AllowedOrigins) == 0 {
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	for _, allowed := range s.opts.AllowedOrigins {
+		if allowed == "*" || strings.EqualFold(allowed, origin) {
+			return true
+		}
+	}
+	return false
+}
+func (s *Server) acquireConnSlot(ip string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.opts.MaxConnections > 0 && len(s.active) >= s.opts.MaxConnections {
+		return errors.New("max connections limit reached")
+	}
+	if s.opts.MaxConnectionsPerIP > 0 && s.ipCount[ip] >= s.opts.MaxConnectionsPerIP {
+		return errors.New("max connections per IP limit reached")
+	}
+	s.ipCount[ip]++
+	return nil
+}
+func (s *Server) releaseConnSlot(ip string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ipCount[ip] > 1 {
+		s.ipCount[ip]--
+	} else {
+		delete(s.ipCount, ip)
+	}
 }
 func (s *Server) Accept() (Conn, error) {
 	select {
@@ -604,7 +682,16 @@ func (s *Server) Accept() (Conn, error) {
 }
 func (s *Server) Remove(id string) {
 	s.mu.Lock()
-	delete(s.active, id)
+	sess, ok := s.active[id]
+	if ok {
+		delete(s.active, id)
+		ip := sess.ip
+		if s.ipCount[ip] > 1 {
+			s.ipCount[ip]--
+		} else {
+			delete(s.ipCount, ip)
+		}
+	}
 	s.mu.Unlock()
 	s.pollMu.Lock()
 	if p := s.pollSess[id]; p != nil {
@@ -618,6 +705,12 @@ func (s *Server) RemoveConn(c Conn) {
 	for id, v := range s.active {
 		if v == c {
 			delete(s.active, id)
+			ip := v.ip
+			if s.ipCount[ip] > 1 {
+				s.ipCount[ip]--
+			} else {
+				delete(s.ipCount, ip)
+			}
 			break
 		}
 	}
@@ -633,6 +726,7 @@ func (s *Server) Close() error {
 			cs = append(cs, c)
 		}
 		s.active = make(map[string]*sessionConn)
+		s.ipCount = make(map[string]int)
 		s.mu.Unlock()
 		for _, c := range cs {
 			_ = c.Close()
@@ -644,7 +738,20 @@ func (s *Server) Close() error {
 	return nil
 }
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if !s.checkOrigin(r) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
+	origin := r.Header.Get("Origin")
+	if len(s.opts.AllowedOrigins) > 0 {
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Vary", "Origin")
+		}
+	} else {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	}
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	if r.Method == http.MethodOptions {
@@ -743,6 +850,15 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	ip := extractIP(r.RemoteAddr)
+	if err := s.acquireConnSlot(ip); err != nil {
+		if s.opts.MaxConnections > 0 && s.Count() >= s.opts.MaxConnections {
+			http.Error(w, "server overloaded", http.StatusServiceUnavailable)
+		} else {
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+		}
+		return
+	}
 	raw, rw, err := func() (net.Conn, *bufio.ReadWriter, error) {
 		hj, ok := w.(http.Hijacker)
 		if !ok {
@@ -752,15 +868,18 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		return hj.Hijack()
 	}()
 	if err != nil {
+		s.releaseConnSlot(ip)
 		return
 	}
 	resp := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + wsAcceptKey(key) + "\r\n\r\n"
 	if _, err = io.WriteString(rw, resp); err != nil {
 		_ = raw.Close()
+		s.releaseConnSlot(ip)
 		return
 	}
 	if err = rw.Flush(); err != nil {
 		_ = raw.Close()
+		s.releaseConnSlot(ip)
 		return
 	}
 	ws := newWSConn(raw, rw, s.opts.MaxPayload, s.opts)
@@ -768,9 +887,12 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	op, _ := json.Marshal(openPacket{SID: sid, Upgrades: []string{}, PingInterval: int(s.opts.PingInterval / time.Millisecond), PingTimeout: int(s.opts.PingTimeout / time.Millisecond), MaxPayload: s.opts.MaxPayload})
 	if err = ws.WriteText(append([]byte{eioOpen}, op...)); err != nil {
 		_ = ws.Close()
+		s.releaseConnSlot(ip)
 		return
 	}
-	sess := newSessionConn(ws)
+	sess := newSessionConn(ws, ip, func() {
+		s.Remove(sid)
+	})
 	s.mu.Lock()
 	s.active[sid] = sess
 	s.mu.Unlock()
@@ -827,9 +949,20 @@ func (s *Server) servePoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sid == "" {
+		ip := extractIP(r.RemoteAddr)
+		if err := s.acquireConnSlot(ip); err != nil {
+			if s.opts.MaxConnections > 0 && s.Count() >= s.opts.MaxConnections {
+				http.Error(w, "server overloaded", http.StatusServiceUnavailable)
+			} else {
+				http.Error(w, "too many requests", http.StatusTooManyRequests)
+			}
+			return
+		}
 		sid = NewSID()
 		pc := newPollConn(sid, r.RemoteAddr, s.opts)
-		sess := newSessionConn(pc)
+		sess := newSessionConn(pc, ip, func() {
+			s.Remove(sid)
+		})
 		s.pollMu.Lock()
 		s.pollSess[sid] = pc
 		s.pollMu.Unlock()
